@@ -1,0 +1,357 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+pfdhcpd - PacketFence DHCP server
+
+=head1 SYNOPSIS
+
+pfdhcpd
+
+=cut
+
+use warnings;
+use strict;
+use English qw( ‐no_match_vars ) ; # Avoids regex performance penalty
+use File::Basename qw(basename);
+use Getopt::Std;
+use Log::Log4perl;
+use Pod::Usage;
+use POSIX qw(:signal_h setsid strftime);
+use Sys::Hostname;
+use IO::Interface::Simple;
+use IO::Select;
+use IO::Socket::INET;
+use Net::DHCP::Packet;
+use Net::DHCP::Constants;
+use NetAddr::IP;
+
+use Data::Dumper;
+
+use constant INSTALL_DIR => '/usr/local/pf';
+
+use lib INSTALL_DIR . "/lib";
+
+use pf::config;
+use pf::util;
+
+# initialization
+# --------------
+# assign process name (see #1464)
+$PROGRAM_NAME = basename($PROGRAM_NAME);
+
+# log4perl init
+Log::Log4perl->init_and_watch( INSTALL_DIR . "/conf/log.conf", $LOG4PERL_RELOAD_TIMER );
+my $logger = Log::Log4perl->get_logger( basename($PROGRAM_NAME) );
+Log::Log4perl::MDC->put( 'proc', basename($PROGRAM_NAME) );
+# storing process id instead of thread id in tid (more useful)
+Log::Log4perl::MDC->put( 'tid', $PID );
+
+# init signal handlers
+POSIX::sigaction(
+    &POSIX::SIGHUP,
+    POSIX::SigAction->new(
+        'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
+    )
+) or $logger->logdie("pfdhcpd: could not set SIGHUP handler: $!");
+
+POSIX::sigaction(
+    &POSIX::SIGTERM,
+    POSIX::SigAction->new(
+        'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
+    )
+) or $logger->logdie("pfdhcpd: could not set SIGTERM handler: $!");
+
+POSIX::sigaction(
+    &POSIX::SIGINT,
+    POSIX::SigAction->new(
+        'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
+    )
+) or $logger->logdie("pfdhcpd: could not set SIGINT handler: $!");
+
+
+my %args;
+getopts( 'dhi:', \%args );
+
+my $daemonize = $args{d};
+
+pod2usage( -verbose => 1 ) if ( $args{h} );
+
+# standard signals and daemonize
+daemonize() if ($daemonize);
+
+my @ip_addr;
+
+#my $memcached = pf::web::util::get_memcached_conf();
+
+my $int;
+foreach $int (@listen_ints) {
+    push @ip_addr, IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, Proto => 'udp', Broadcast => 1);
+    # Only bind to a specific interface
+    $ip_addr[-1]->sockopt(25, $int);
+}
+
+# Adding to select:
+my $read_set = new IO::Select();
+
+my $sock_in;
+my %listen_handler;
+my %ethernet_inf;
+
+foreach $sock_in (@ip_addr) {
+    $read_set->add($sock_in);
+    $listen_handler{$sock_in} = \&dhcpd_handler;
+    $ethernet_inf{$sock_in} = shift @listen_ints;
+}
+
+# entering loop
+while (1) {
+    my @select_set = $read_set->can_read;
+    foreach my $server (@select_set) {
+        my $handler = $listen_handler{$server};
+        $handler->($server);
+    }
+}
+
+sub dhcpd_handler {
+    my ($sock_in) = @_;
+    my $transaction = 0;            # report transaction number
+
+    my $sock_answer;
+    my $buf = undef;
+    my $fromaddr;                        # address & port from which packet was received
+    my $dhcpreq;
+    my $net_addr;
+    my %dhcp_config;
+
+    my $if   = IO::Interface::Simple->new($ethernet_inf{$sock_in});
+    $logger->warn("Incoming DHCP request on interface $ethernet_inf{$sock_in}");
+    $logger->warn("Incoming DHCP request on ip $if->address");
+
+    eval {                    # catch fatal errors
+
+         # receive packet
+         $fromaddr = $sock_in->recv($buf,4096) || $logger->warn("recv:$!");
+         next if ($!);        # continue loop if an error occured
+         $transaction++;                    # transaction counter
+      
+         {
+             use bytes;
+             my ($port,$addr) = unpack_sockaddr_in($fromaddr);
+             my $ipaddr = inet_ntoa($addr);
+             my $peeraddr;
+             $logger->warn("Got a packet tr=$transaction src=$ipaddr:$port length=".length($buf));
+             #Suppose Layer 2 search for the direct network
+             if ($ipaddr eq '0.0.0.0') {
+                 $peeraddr = '255.255.255.255';
+                 $net_addr = NetAddr::IP->new($if->address,$if->netmask);
+                 my $net = $net_addr->network;
+                 %dhcp_config = %{$ConfigNetworks{$net->addr()}};
+             }
+             #Suppose Layer 3 search for the remote network
+             else {
+                 $peeraddr = $ipaddr;
+                 foreach my $network ( keys %ConfigNetworks ) {
+                     # shorter, more convenient local accessor
+                     $net_addr = NetAddr::IP->new($network,$ConfigNetworks{$network}{'netmask'});
+                     my $ip = new NetAddr::IP::Lite clean_ip($ipaddr);
+                     if ($net_addr->contains($ip)) {
+                         my $net = $net_addr->network;
+                         %dhcp_config = %{$ConfigNetworks{$net->addr()}};
+                         last;
+                     }
+                 }
+             }
+             #Open a socket to answer to the client
+             $sock_answer = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $if->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
+         }
+  
+         my $dhcpreq = new Net::DHCP::Packet($buf);
+
+         $logger->debug($dhcpreq->toString());
+         my $messagetype = $dhcpreq->getOptionValue(DHO_DHCP_MESSAGE_TYPE());
+
+         if ($messagetype eq DHCPDISCOVER()) {
+                 do_discover($dhcpreq,$sock_answer,$if->address,\%dhcp_config,\$net_addr);
+         } elsif ($messagetype eq DHCPREQUEST()) {
+                do_request($dhcpreq,$sock_answer,$if->address,\%dhcp_config,\$net_addr);
+         } elsif ($messagetype eq DHCPINFORM()) {
+             
+         } else {
+             $logger->warn("Packet dropped");
+             # bad messagetype, we drop it
+         }
+    };
+    # end of 'eval' blocks
+
+    if ($@) {
+        $logger->warn("Caught error in main loop:$@");
+    }
+       
+}
+
+sub do_discover {
+    my ($dhcpreq, $sock_in, $ip_src,$dhcp_config,$net_addr) = @_;
+    my $calc_ip;
+
+    # TODO calculate address something like sqlite...
+    $calc_ip = "192.168.0.101";
+  
+    my $broadcast = $$net_addr->broadcast();
+
+    my $dhcpresp = new Net::DHCP::Packet(
+        Comment => $dhcpreq->comment(),
+        Op => BOOTREPLY(),
+        Hops => $dhcpreq->hops(),
+        Xid => $dhcpreq->xid(),
+        Flags => $dhcpreq->flags(),
+        Ciaddr => $dhcpreq->ciaddr(),
+        Yiaddr => $calc_ip,
+        Siaddr => $dhcpreq->siaddr(),
+        Giaddr => $dhcpreq->giaddr(),
+        Chaddr => $dhcpreq->chaddr(),
+        DHO_DHCP_MESSAGE_TYPE() => DHCPOFFER(),
+    );
+    $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $ip_src);
+    $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
+    $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
+    $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
+    $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() ,$dhcp_config->{'dns'});
+
+    $logger->debug($dhcpresp->toString());
+    $sock_in->send($dhcpresp->serialize()) || die "Error sending OFFER:$!\n";
+    shutdown($sock_in, 2);
+}
+
+sub do_request {
+    my ($dhcpreq,$sock_in,$ip_src,$dhcp_config,$net_addr) = @_;
+    my $calc_ip;
+    my $dhcpresp;
+
+    
+    #TODO Calculate ip address like sqlite...
+    $calc_ip = "192.168.0.101";
+
+    my $broadcast = $$net_addr->broadcast();
+
+    # compare calculated address with requested address
+    if ($calc_ip eq $dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS())) {
+        # address is correct, we send an ACK
+  
+        $dhcpresp = new Net::DHCP::Packet(
+            Comment => $dhcpreq->comment(),
+            Op => BOOTREPLY(),
+            Hops => $dhcpreq->hops(),
+            Xid => $dhcpreq->xid(),
+            Flags => $dhcpreq->flags(),
+            Ciaddr => $dhcpreq->ciaddr(),
+            Yiaddr => $calc_ip,
+            Siaddr => $dhcpreq->siaddr(),
+            Giaddr => $dhcpreq->giaddr(),
+            Chaddr => $dhcpreq->chaddr(),
+            DHO_DHCP_MESSAGE_TYPE() => DHCPACK(),
+        );
+        $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $ip_src);
+        $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
+        $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
+        $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
+        $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() ,$dhcp_config->{'dns'});
+        $dhcpresp->addOptionValue(DHO_DOMAIN_NAME() , $dhcp_config->{'domain-name'});
+        $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
+        $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+        $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+
+    } else {
+        # bad request, we send a NAK
+        $dhcpresp = new Net::DHCP::Packet(
+            Comment => $dhcpreq->comment(),
+            Op => BOOTREPLY(),
+            Hops => $dhcpreq->hops(),
+            Xid => $dhcpreq->xid(),
+            Flags => $dhcpreq->flags(),
+            Ciaddr => $dhcpreq->ciaddr(),
+            Yiaddr => "0.0.0.0",
+            Siaddr => $dhcpreq->siaddr(),
+            Giaddr => $dhcpreq->giaddr(),
+            Chaddr => $dhcpreq->chaddr(),
+            DHO_DHCP_MESSAGE_TYPE() => DHCPNAK(),
+            DHO_DHCP_MESSAGE(), "Bad request...",
+        );
+    }
+
+    # Socket object keeps track of whom sent last packet
+    # so we don't need to specify target address
+    $logger->debug("Sending ACK/NAK tr=$dhcpresp->comment()");
+    $logger->debug($dhcpresp->toString());
+    $sock_in->send($dhcpresp->serialize()) || die "Error sending ACK/NAK:$!\n";
+    shutdown($sock_in, 2);
+}
+
+
+sub daemonize {
+    chdir '/' or $logger->logdie("Can't chdir to /: $!");
+    open STDIN, '<', '/dev/null'
+        or $logger->logdie("Can't read /dev/null: $!");
+    open STDOUT, '>', '/dev/null'
+        or $logger->logdie("Can't write to /dev/null: $!");
+
+    defined( my $pid = fork )
+        or $logger->logdie("pfdhcpd: could not fork: $!");
+    POSIX::_exit(0) if ($pid);
+    if ( !POSIX::setsid() ) {
+        $logger->error("could not start a new session: $!");
+    }
+    open STDERR, '>&STDOUT' or $logger->logdie("Can't dup stdout: $!");
+    my $daemon_pid = createpid("pfdhcpd");
+
+    # updating Log4perl's pid info
+    Log::Log4perl::MDC->put( 'tid', $daemon_pid );
+}
+
+sub normal_sighandler {
+    deletepid("pfdhcpd");
+    if ( threads->self->tid() == 0 ) {
+        $logger->logdie(
+            "pfdhcpd: caught SIG" . $_[0] . " - terminating" );
+    }
+}
+
+
+=back
+
+=head1 BUGS AND LIMITATIONS
+
+Probably
+
+=head1 AUTHOR
+
+Inverse inc. <info@inverse.ca>
+
+Minor parts of this file may have been contributed. See CREDITS.
+
+=head1 COPYRIGHT
+
+Copyright (C) 2005-2013 Inverse inc.
+
+Copyright (C) 2005 Kevin Amorin
+
+Copyright (C) 2005 David LaPorte
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
+USA.
+
+=cut
