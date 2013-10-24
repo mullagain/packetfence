@@ -26,8 +26,6 @@ use Net::DHCP::Packet;
 use Net::DHCP::Constants;
 use NetAddr::IP;
 
-use Data::Dumper;
-
 use constant INSTALL_DIR => '/usr/local/pf';
 
 use lib INSTALL_DIR . "/lib";
@@ -316,26 +314,13 @@ sub normal_sighandler {
     }
 }
 
-
-=back
-
-=head1 BUGS AND LIMITATIONS
-
-Probably
-
 =head1 AUTHOR
 
 Inverse inc. <info@inverse.ca>
 
-Minor parts of this file may have been contributed. See CREDITS.
-
 =head1 COPYRIGHT
 
 Copyright (C) 2005-2013 Inverse inc.
-
-Copyright (C) 2005 Kevin Amorin
-
-Copyright (C) 2005 David LaPorte
 
 =head1 LICENSE
 
