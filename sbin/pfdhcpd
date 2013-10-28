@@ -25,6 +25,9 @@ use IO::Socket::INET;
 use Net::DHCP::Packet;
 use Net::DHCP::Constants;
 use NetAddr::IP;
+use Tie::Hash::Expire;
+use Net::Ping;
+
 
 use constant INSTALL_DIR => '/usr/local/pf';
 
@@ -95,12 +98,23 @@ my $read_set = new IO::Select();
 my $sock_in;
 my %listen_handler;
 my %ethernet_inf;
+my %lease;
 
 foreach $sock_in (@ip_addr) {
     $read_set->add($sock_in);
     $listen_handler{$sock_in} = \&dhcpd_handler;
     $ethernet_inf{$sock_in} = shift @listen_ints;
 }
+
+
+# Create lease hash
+
+foreach my $network ( keys %ConfigNetworks ) {
+    my %expire;
+    tie %expire, 'Tie::Hash::Expire', {'expire_seconds' => $ConfigNetworks{$network}{'dhcp_max_lease_time'}};
+    $lease{$network} = \%expire;
+}
+
 
 # entering loop
 while (1) {
@@ -123,8 +137,9 @@ sub dhcpd_handler {
     my %dhcp_config;
 
     my $if   = IO::Interface::Simple->new($ethernet_inf{$sock_in});
-    $logger->warn("Incoming DHCP request on interface $ethernet_inf{$sock_in}");
-    $logger->warn("Incoming DHCP request on ip $if->address");
+    $logger->debug("Incoming DHCP request on interface $ethernet_inf{$sock_in}");
+    $logger->debug("Incoming DHCP request on ip ".$if->address);
+
 
     eval {                    # catch fatal errors
 
@@ -138,13 +153,14 @@ sub dhcpd_handler {
              my ($port,$addr) = unpack_sockaddr_in($fromaddr);
              my $ipaddr = inet_ntoa($addr);
              my $peeraddr;
-             $logger->warn("Got a packet tr=$transaction src=$ipaddr:$port length=".length($buf));
+             $logger->debug("Got a packet tr=$transaction src=$ipaddr:$port length=".length($buf));
              #Suppose Layer 2 search for the direct network
              if ($ipaddr eq '0.0.0.0') {
                  $peeraddr = '255.255.255.255';
                  $net_addr = NetAddr::IP->new($if->address,$if->netmask);
                  my $net = $net_addr->network;
-                 %dhcp_config = %{$ConfigNetworks{$net->addr()}};
+		 my $netAddress = $net->addr;
+                 %dhcp_config = %{$ConfigNetworks{$netAddress}} if(exists $ConfigNetworks{$netAddress} && defined $ConfigNetworks{$netAddress});
              }
              #Suppose Layer 3 search for the remote network
              else {
@@ -155,7 +171,8 @@ sub dhcpd_handler {
                      my $ip = new NetAddr::IP::Lite clean_ip($ipaddr);
                      if ($net_addr->contains($ip)) {
                          my $net = $net_addr->network;
-                         %dhcp_config = %{$ConfigNetworks{$net->addr()}};
+                         my $netAddress = $net->addr;
+                         %dhcp_config = %{$ConfigNetworks{$netAddress}} if(exists $ConfigNetworks{$netAddress} && defined $ConfigNetworks{$netAddress});
                          last;
                      }
                  }
@@ -176,7 +193,7 @@ sub dhcpd_handler {
          } elsif ($messagetype eq DHCPINFORM()) {
              
          } else {
-             $logger->warn("Packet dropped");
+             $logger->debug("Packet dropped");
              # bad messagetype, we drop it
          }
     };
@@ -190,64 +207,27 @@ sub dhcpd_handler {
 
 sub do_discover {
     my ($dhcpreq, $sock_in, $ip_src,$dhcp_config,$net_addr) = @_;
-    my $calc_ip;
+    #my ($calc_ip, $calc_router, $calc_mask);
 
-    # TODO calculate address something like sqlite...
-    $calc_ip = "192.168.0.101";
-  
-    my $broadcast = $$net_addr->broadcast();
+    if (defined($dhcp_config)) {
+        # TODO calculate address something like sqlite...
+        my $net = $$net_addr->network;
+        my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr);
+        $lease{$net->addr}{$dhcpreq->chaddr} = $ip;
+        my $broadcast = $$net_addr->broadcast();
 
-    my $dhcpresp = new Net::DHCP::Packet(
-        Comment => $dhcpreq->comment(),
-        Op => BOOTREPLY(),
-        Hops => $dhcpreq->hops(),
-        Xid => $dhcpreq->xid(),
-        Flags => $dhcpreq->flags(),
-        Ciaddr => $dhcpreq->ciaddr(),
-        Yiaddr => $calc_ip,
-        Siaddr => $dhcpreq->siaddr(),
-        Giaddr => $dhcpreq->giaddr(),
-        Chaddr => $dhcpreq->chaddr(),
-        DHO_DHCP_MESSAGE_TYPE() => DHCPOFFER(),
-    );
-    $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $ip_src);
-    $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
-    $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
-    $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
-    $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() ,$dhcp_config->{'dns'});
-
-    $logger->debug($dhcpresp->toString());
-    $sock_in->send($dhcpresp->serialize()) || die "Error sending OFFER:$!\n";
-    shutdown($sock_in, 2);
-}
-
-sub do_request {
-    my ($dhcpreq,$sock_in,$ip_src,$dhcp_config,$net_addr) = @_;
-    my $calc_ip;
-    my $dhcpresp;
-
-    
-    #TODO Calculate ip address like sqlite...
-    $calc_ip = "192.168.0.101";
-
-    my $broadcast = $$net_addr->broadcast();
-
-    # compare calculated address with requested address
-    if ($calc_ip eq $dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS())) {
-        # address is correct, we send an ACK
-  
-        $dhcpresp = new Net::DHCP::Packet(
+        my $dhcpresp = new Net::DHCP::Packet(
             Comment => $dhcpreq->comment(),
             Op => BOOTREPLY(),
             Hops => $dhcpreq->hops(),
             Xid => $dhcpreq->xid(),
             Flags => $dhcpreq->flags(),
             Ciaddr => $dhcpreq->ciaddr(),
-            Yiaddr => $calc_ip,
+            Yiaddr => $ip,
             Siaddr => $dhcpreq->siaddr(),
             Giaddr => $dhcpreq->giaddr(),
             Chaddr => $dhcpreq->chaddr(),
-            DHO_DHCP_MESSAGE_TYPE() => DHCPACK(),
+            DHO_DHCP_MESSAGE_TYPE() => DHCPOFFER(),
         );
         $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $ip_src);
         $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
@@ -259,32 +239,108 @@ sub do_request {
         $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
         $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
 
-    } else {
-        # bad request, we send a NAK
-        $dhcpresp = new Net::DHCP::Packet(
-            Comment => $dhcpreq->comment(),
-            Op => BOOTREPLY(),
-            Hops => $dhcpreq->hops(),
-            Xid => $dhcpreq->xid(),
-            Flags => $dhcpreq->flags(),
-            Ciaddr => $dhcpreq->ciaddr(),
-            Yiaddr => "0.0.0.0",
-            Siaddr => $dhcpreq->siaddr(),
-            Giaddr => $dhcpreq->giaddr(),
-            Chaddr => $dhcpreq->chaddr(),
-            DHO_DHCP_MESSAGE_TYPE() => DHCPNAK(),
-            DHO_DHCP_MESSAGE(), "Bad request...",
-        );
-    }
+        $logger->debug($dhcpresp->toString());
+        $sock_in->send($dhcpresp->serialize()) || die "Error sending OFFER:$!\n";
+        shutdown($sock_in, 2);
+    } else { #Just parse the request
 
-    # Socket object keeps track of whom sent last packet
-    # so we don't need to specify target address
-    $logger->debug("Sending ACK/NAK tr=$dhcpresp->comment()");
-    $logger->debug($dhcpresp->toString());
-    $sock_in->send($dhcpresp->serialize()) || die "Error sending ACK/NAK:$!\n";
-    shutdown($sock_in, 2);
+    }
 }
 
+sub do_request {
+    my ($dhcpreq,$sock_in,$ip_src,$dhcp_config,$net_addr) = @_;
+
+    if(defined($dhcp_config)) {
+        #my $calc_ip;
+        my $dhcpresp;
+
+    
+        #TODO Calculate ip address like sqlite...
+        my $net = $$net_addr->network;
+        my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr,$dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS()));
+        $lease{$net->addr}{$dhcpreq->chaddr} = $ip; 
+
+        my $broadcast = $$net_addr->broadcast();
+
+        # compare calculated address with requested address
+        if ( defined($dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS())) && ($ip eq $dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS()))) {
+            # address is correct, we send an ACK
+  
+            $dhcpresp = new Net::DHCP::Packet(
+                Comment => $dhcpreq->comment(),
+                Op => BOOTREPLY(),
+                Hops => $dhcpreq->hops(),
+                Xid => $dhcpreq->xid(),
+                Flags => $dhcpreq->flags(),
+                Ciaddr => $dhcpreq->ciaddr(),
+                Yiaddr => $ip,
+                Siaddr => $dhcpreq->siaddr(),
+                Giaddr => $dhcpreq->giaddr(),
+                Chaddr => $dhcpreq->chaddr(),
+                DHO_DHCP_MESSAGE_TYPE() => DHCPACK(),
+            );
+            $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $ip_src);
+            $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
+            $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
+            $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
+            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() ,$dhcp_config->{'dns'});
+            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME() , $dhcp_config->{'domain-name'});
+            $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
+            $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+            $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+
+        } else {
+            # bad request, we send a NAK
+            $dhcpresp = new Net::DHCP::Packet(
+                Comment => $dhcpreq->comment(),
+                Op => BOOTREPLY(),
+                Hops => $dhcpreq->hops(),
+                Xid => $dhcpreq->xid(),
+                Flags => $dhcpreq->flags(),
+                Ciaddr => $dhcpreq->ciaddr(),
+                Yiaddr => "0.0.0.0",
+                Siaddr => $dhcpreq->siaddr(),
+                Giaddr => $dhcpreq->giaddr(),
+                Chaddr => $dhcpreq->chaddr(),
+                DHO_DHCP_MESSAGE_TYPE() => DHCPNAK(),
+                DHO_DHCP_MESSAGE(), "Bad request...",
+            );
+        }
+
+        # Socket object keeps track of whom sent last packet
+        # so we don't need to specify target address
+        $logger->debug("Sending ACK/NAK tr=$dhcpresp->comment()");
+        $logger->debug($dhcpresp->toString());
+        $sock_in->send($dhcpresp->serialize()) || die "Error sending ACK/NAK:$!\n";
+        shutdown($sock_in, 2);
+    } else { #Just parse the request
+
+    }
+}
+
+sub calc_ip {
+    my ($dhcp_config, $net_addr,$mac,$host) = @_;
+    my $ip_return;
+    my $p = Net::Ping->new("icmp");
+    if (defined($lease{$net_addr->addr}{$mac}) || (defined($host) && !$p->ping($host) ) ) {
+        $lease{$net_addr->addr}{$net_addr->addr} = $lease{$net_addr->addr}{$net_addr->addr};
+        return $lease{$net_addr->addr}{$mac};
+    }
+    if (defined($lease{$net_addr->addr}{$net_addr->addr})) {
+        my $ip = NetAddr::IP->new($lease{$net_addr->addr}{$net_addr->addr},$dhcp_config->{'netmask'});
+        my $ip_last = NetAddr::IP->new($dhcp_config->{'dhcp_end'},$dhcp_config->{'netmask'});
+        if (($ip + 1) eq $ip_last) {
+            $ip_return = $dhcp_config->{'dhcp_start'};
+        } else {
+            $ip = $ip + 1;
+            $ip_return = $ip->addr;
+        }
+    } else {
+        $ip_return = $dhcp_config->{'dhcp_start'};
+    }
+    $lease{$net_addr->addr}{$net_addr->addr} = $ip_return;
+    return $ip_return;
+}
 
 sub daemonize {
     chdir '/' or $logger->logdie("Can't chdir to /: $!");
