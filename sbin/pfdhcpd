@@ -27,6 +27,10 @@ use Net::DHCP::Constants;
 use NetAddr::IP;
 use Tie::Hash::Expire;
 use Net::Ping;
+use List::MoreUtils qw(uniq);
+use Readonly;
+
+use Data::Dumper;
 
 
 use constant INSTALL_DIR => '/usr/local/pf';
@@ -35,6 +39,42 @@ use lib INSTALL_DIR . "/lib";
 
 use pf::config;
 use pf::util;
+use pf::iplog;
+use pf::config::cached;
+use pf::db;
+use pf::inline::custom $INLINE_API_LEVEL;
+use pf::locationlog;
+use pf::lookup::node;
+use pf::node;
+use pf::os;
+use pf::violation qw(violation_trigger);
+use pf::ipset;
+use pf::stats;
+
+Readonly my %MESSAGE_TYPE => (
+    'DHCPDISCOVER' => 1,
+    'DHCPOFFER' => 2,
+    'DHCPREQUEST' => 3,
+    'DHCPDECLINE' => 4,
+    'DHCPACK' => 5,
+    'DHCPNAK' => 6,
+    'DHCPRELEASE' => 7,
+    'DHCPINFORM' => 8,
+);
+
+Readonly my %MESSAGE_TYPE_TO_STRING => reverse %MESSAGE_TYPE;
+
+my $sock_in;
+my %listen_handler;
+my %ethernet_inf;
+my %lease;
+my $ROGUE_DHCP_TRIGGER = '1100010';
+my %rogue_servers;
+my $is_inline_vlan;
+my $accessControl;
+my $interface_ip;
+my $interface_vlan;
+my @local_dhcp_servers;
 
 # initialization
 # --------------
@@ -54,14 +94,14 @@ POSIX::sigaction(
     POSIX::SigAction->new(
         'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
     )
-) or $logger->logdie("pfdhcpd: could not set SIGHUP handler: $!");
+) or $logger->logdie("pfdns: could not set SIGHUP handler: $!");
 
 POSIX::sigaction(
     &POSIX::SIGTERM,
     POSIX::SigAction->new(
         'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
     )
-) or $logger->logdie("pfdhcpd: could not set SIGTERM handler: $!");
+) or $logger->logdie("pfdns: could not set SIGTERM handler: $!");
 
 POSIX::sigaction(
     &POSIX::SIGINT,
@@ -75,6 +115,7 @@ my %args;
 getopts( 'dhi:', \%args );
 
 my $daemonize = $args{d};
+my $listen = $args{l};
 
 pod2usage( -verbose => 1 ) if ( $args{h} );
 
@@ -83,10 +124,10 @@ daemonize() if ($daemonize);
 
 my @ip_addr;
 
-#my $memcached = pf::web::util::get_memcached_conf();
+my @ints = uniq(@listen_ints,@dhcplistener_ints);
 
 my $int;
-foreach $int (@listen_ints) {
+foreach $int (@ints) {
     push @ip_addr, IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, Proto => 'udp', Broadcast => 1);
     # Only bind to a specific interface
     $ip_addr[-1]->sockopt(25, $int);
@@ -95,19 +136,14 @@ foreach $int (@listen_ints) {
 # Adding to select:
 my $read_set = new IO::Select();
 
-my $sock_in;
-my %listen_handler;
-my %ethernet_inf;
-my %lease;
-
 foreach $sock_in (@ip_addr) {
     $read_set->add($sock_in);
     $listen_handler{$sock_in} = \&dhcpd_handler;
-    $ethernet_inf{$sock_in} = shift @listen_ints;
+    $ethernet_inf{$sock_in} = shift @ints;
 }
 
 
-# Create lease hash
+# Create lease hash (expire hash)
 
 foreach my $network ( keys %ConfigNetworks ) {
     my %expire;
@@ -136,66 +172,123 @@ sub dhcpd_handler {
     my $net_addr;
     my %dhcp_config;
 
+    #if is the interface where the dhcp traffic is coming
+ 
     my $if   = IO::Interface::Simple->new($ethernet_inf{$sock_in});
+
     $logger->debug("Incoming DHCP request on interface $ethernet_inf{$sock_in}");
     $logger->debug("Incoming DHCP request on ip ".$if->address);
 
 
+
     eval {                    # catch fatal errors
 
-         # receive packet
-         $fromaddr = $sock_in->recv($buf,4096) || $logger->warn("recv:$!");
-         next if ($!);        # continue loop if an error occured
-         $transaction++;                    # transaction counter
-      
-         {
-             use bytes;
-             my ($port,$addr) = unpack_sockaddr_in($fromaddr);
-             my $ipaddr = inet_ntoa($addr);
-             my $peeraddr;
-             $logger->debug("Got a packet tr=$transaction src=$ipaddr:$port length=".length($buf));
-             #Suppose Layer 2 search for the direct network
-             if ($ipaddr eq '0.0.0.0') {
-                 $peeraddr = '255.255.255.255';
-                 $net_addr = NetAddr::IP->new($if->address,$if->netmask);
-                 my $net = $net_addr->network;
-		 my $netAddress = $net->addr;
-                 %dhcp_config = %{$ConfigNetworks{$netAddress}} if(exists $ConfigNetworks{$netAddress} && defined $ConfigNetworks{$netAddress});
-             }
-             #Suppose Layer 3 search for the remote network
-             else {
-                 $peeraddr = $ipaddr;
-                 foreach my $network ( keys %ConfigNetworks ) {
-                     # shorter, more convenient local accessor
-                     $net_addr = NetAddr::IP->new($network,$ConfigNetworks{$network}{'netmask'});
-                     my $ip = new NetAddr::IP::Lite clean_ip($ipaddr);
-                     if ($net_addr->contains($ip)) {
-                         my $net = $net_addr->network;
-                         my $netAddress = $net->addr;
-                         %dhcp_config = %{$ConfigNetworks{$netAddress}} if(exists $ConfigNetworks{$netAddress} && defined $ConfigNetworks{$netAddress});
-                         last;
-                     }
-                 }
-             }
+        # receive packet
+        $fromaddr = $sock_in->recv($buf,4096) || $logger->warn("recv:$!");
+        next if ($!);        # continue loop if an error occured
+        $transaction++;                    # transaction counter
+        my $peeraddr; 
+        {
+            use bytes;
+
+            #Source ip address and port
+            my ($port,$addr) = unpack_sockaddr_in($fromaddr);
+            my $ipaddr = inet_ntoa($addr);
+
+            $logger->debug("Got a packet tr=$transaction src=$ipaddr:$port length=".length($buf));
+            #Suppose Layer 2 search for the direct network
+            if ($ipaddr eq '0.0.0.0') {
+                $peeraddr = '255.255.255.255';
+
+                #Fetch the dhcp_config based on the network interface
+                $net_addr = NetAddr::IP->new($if->address,$if->netmask);
+                my $net = $net_addr->network;
+                my $netAddress = $net->addr;
+                %dhcp_config = %{$ConfigNetworks{$netAddress}} if(exists $ConfigNetworks{$netAddress} && defined $ConfigNetworks{$netAddress});
+            }
+            #Suppose Layer 3 search for the remote network
+            else {
+                #Fetch the dhcp_config based on the source ip address 
+                $peeraddr = $ipaddr;
+                foreach my $network ( keys %ConfigNetworks ) {
+                    # shorter, more convenient local accessor
+                    $net_addr = NetAddr::IP->new($network,$ConfigNetworks{$network}{'netmask'});
+                    my $ip = new NetAddr::IP::Lite clean_ip($ipaddr);
+                    if ($net_addr->contains($ip)) {
+                        my $net = $net_addr->network;
+                        my $netAddress = $net->addr;
+                        %dhcp_config = %{$ConfigNetworks{$netAddress}} if(exists $ConfigNetworks{$netAddress} && defined $ConfigNetworks{$netAddress});
+                        last;
+                    }
+                }
+            }
              #Open a socket to answer to the client
-             $sock_answer = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $if->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
-         }
+             #$sock_answer = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $if->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
+        }
   
-         my $dhcpreq = new Net::DHCP::Packet($buf);
+        my $dhcpreq = new Net::DHCP::Packet($buf);
 
-         $logger->debug($dhcpreq->toString());
-         my $messagetype = $dhcpreq->getOptionValue(DHO_DHCP_MESSAGE_TYPE());
+        $logger->debug($dhcpreq->toString());
 
-         if ($messagetype eq DHCPDISCOVER()) {
-                 do_discover($dhcpreq,$sock_answer,$if->address,\%dhcp_config,\$net_addr);
-         } elsif ($messagetype eq DHCPREQUEST()) {
-                do_request($dhcpreq,$sock_answer,$if->address,\%dhcp_config,\$net_addr);
-         } elsif ($messagetype eq DHCPINFORM()) {
-             
-         } else {
-             $logger->debug("Packet dropped");
-             # bad messagetype, we drop it
-         }
+        # Add mac if not exist
+        my $mac = clean_mac( substr( $dhcpreq->chaddr(), 0, 12 ) );
+        if ( !node_exist($mac) ) {
+            $logger->info("Unseen before node added: $mac");
+            node_add_simple($mac);
+        }
+
+        # There is activity from that mac, call node wakeup
+        node_mac_wakeup($mac);
+
+        # Option 82 Relay Agent Information (RFC3046)
+        if ( isenabled( $Config{'network'}{'dhcpoption82logger'} ) && defined( $dhcpreq->getOptionValue(DHO_DHCP_AGENT_OPTIONS()) ) ) {
+            parse_dhcp_option82($dhcpreq);
+        }
+
+        # Proceed with the fingerpint
+
+        # updating the node first
+        # in case the fingerprint generates a violation and that autoreg uses fingerprint to auto-categorize nodes
+        # see #1216 for details
+        my %tmp;
+        $tmp{'dhcp_fingerprint'} = defined($dhcpreq->getOptionValue(DHO_DHCP_PARAMETER_REQUEST_LIST() ) ) ? $dhcpreq->getOptionValue(DHO_DHCP_PARAMETER_REQUEST_LIST() ) : '';
+        $tmp{'dhcp_fingerprint'} =~ s/\s/,/g;
+        $tmp{'last_dhcp'} = mysql_date();
+        $tmp{'computername'} = defined($dhcpreq->getOptionValue(DHO_HOST_NAME() )) ? $dhcpreq->getOptionValue(DHO_HOST_NAME() ) : '';
+        my $vendor_id = defined($dhcpreq->getOptionValue(DHO_VENDOR_CLASS_IDENTIFIER() )) ? $dhcpreq->getOptionValue(DHO_VENDOR_CLASS_IDENTIFIER() ) : '';
+        node_modify( $mac, %tmp );
+        my $stats = pf::stats->new();
+        $stats->stats_dhcp($mac,$tmp{'dhcp_fingerprint'},$vendor_id,$tmp{'computername'});
+
+        my $fingerprint_data = process_fingerprint($dhcpreq);
+
+        my $modified_node_log_message = '';
+        foreach my $node_key ( keys %tmp ) {
+            $modified_node_log_message .= "$node_key = " . $tmp{$node_key} . ",";
+        }
+        chop($modified_node_log_message);
+
+        $logger->info("$mac requested an IP. "
+            . ( defined($fingerprint_data) ? "DHCP Fingerprint: $fingerprint_data. " : "Unknown DHCP fingerprint. " )
+            . "Modified node with $modified_node_log_message"
+        );
+
+
+        #Fetch the request type in the dhcp packet
+        my $messagetype = $dhcpreq->getOptionValue(DHO_DHCP_MESSAGE_TYPE());
+
+        if ($messagetype eq DHCPDISCOVER()) {
+            do_discover($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr);
+        } elsif ($messagetype eq DHCPREQUEST()) {
+            do_request($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr);
+        } elsif ($messagetype eq DHCPINFORM()) {
+            parse_dhcp_inform($dhcpreq,\$if);         
+        } elsif ($messagetype eq DHCPRELEASE()) {
+            parse_dhcp_release($dhcpreq,\$if);
+        } else {
+            $logger->warn("Packet dropped");
+            # bad messagetype, we drop it
+        }
     };
     # end of 'eval' blocks
 
@@ -206,16 +299,25 @@ sub dhcpd_handler {
 }
 
 sub do_discover {
-    my ($dhcpreq, $sock_in, $ip_src,$dhcp_config,$net_addr) = @_;
-    #my ($calc_ip, $calc_router, $calc_mask);
+    my ($dhcpreq, $peeraddr, $ip_src,$dhcp_config,$net_addr) = @_;
+    # $dhcpreq is the dhcp request object
+    # $peeraddr is the ip source of the packet
+    # $ip_src is the network interface where the packet is coming
+    # $dhcp_config is the dhcp config for this network from networks.conf
+    # $net_addr is a NetAddr::IP object of the dhcp zone
 
+    # If we find a dhcp configuration then we have to answer
     if (defined($dhcp_config)) {
-        # TODO calculate address something like sqlite...
         my $net = $$net_addr->network;
+
+        # Calculate the ip address
         my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr);
+        #File the lease hash
         $lease{$net->addr}{$dhcpreq->chaddr} = $ip;
+        # Need the broadcast address
         my $broadcast = $$net_addr->broadcast();
 
+        # Create the dhcp offer
         my $dhcpresp = new Net::DHCP::Packet(
             Comment => $dhcpreq->comment(),
             Op => BOOTREPLY(),
@@ -227,45 +329,62 @@ sub do_discover {
             Siaddr => $dhcpreq->siaddr(),
             Giaddr => $dhcpreq->giaddr(),
             Chaddr => $dhcpreq->chaddr(),
-            DHO_DHCP_MESSAGE_TYPE() => DHCPOFFER(),
-        );
-        $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $ip_src);
-        $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
-        $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
-        $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
-        $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() ,$dhcp_config->{'dns'});
-        $dhcpresp->addOptionValue(DHO_DOMAIN_NAME() , $dhcp_config->{'domain-name'});
-        $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
-        $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
-        $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+            DHO_DHCP_MESSAGE_TYPE() => DHCPOFFER()
+            );
+            $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $$ip_src->address);
+            $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
+            $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
+            $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
+            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() , $dhcp_config->{'dns'});
+            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME() , $dhcp_config->{'domain-name'});
+            $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
+            $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+            $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+
+        # Parse the dhcp offer
+        parse_dhcp_offer($dhcpresp,$ip_src);
+
+        # Create the socket to answer to the client
+        my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
 
         $logger->debug($dhcpresp->toString());
-        $sock_in->send($dhcpresp->serialize()) || die "Error sending OFFER:$!\n";
+        # Send the packet to the network
+        $sock_in->send($dhcpresp->serialize());
         shutdown($sock_in, 2);
-    } else { #Just parse the request
-
     }
+    # Parse the dhcp discover in all case
+    parse_dhcp_discover($dhcpreq,$ip_src);
 }
 
 sub do_request {
-    my ($dhcpreq,$sock_in,$ip_src,$dhcp_config,$net_addr) = @_;
+    my ($dhcpreq,$peeraddr,$ip_src,$dhcp_config,$net_addr) = @_;
+    # $dhcpreq is the dhcp request object
+    # $peeraddr is the ip source of the packet
+    # $ip_src is the network interface where the packet is coming
+    # $dhcp_config is the dhcp config for this network from networks.conf
+    # $net_addr is a NetAddr::IP object of the dhcp zone
 
+    # If we find a dhcp configuration then we have to answer
     if(defined($dhcp_config)) {
-        #my $calc_ip;
         my $dhcpresp;
-
-    
-        #TODO Calculate ip address like sqlite...
         my $net = $$net_addr->network;
+
+        # Calculate the ip address
         my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr,$dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS()));
+
+        # File the lease hash
         $lease{$net->addr}{$dhcpreq->chaddr} = $ip; 
 
+        # Need the broadcast address
         my $broadcast = $$net_addr->broadcast();
 
         # compare calculated address with requested address
         if ( defined($dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS())) && ($ip eq $dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS()))) {
             # address is correct, we send an ACK
-  
+
+            # Send to the specific ip (Buggy ?)
+            # $peeraddr = $ip;
+
             $dhcpresp = new Net::DHCP::Packet(
                 Comment => $dhcpreq->comment(),
                 Op => BOOTREPLY(),
@@ -277,17 +396,19 @@ sub do_request {
                 Siaddr => $dhcpreq->siaddr(),
                 Giaddr => $dhcpreq->giaddr(),
                 Chaddr => $dhcpreq->chaddr(),
-                DHO_DHCP_MESSAGE_TYPE() => DHCPACK(),
-            );
-            $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $ip_src);
-            $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
-            $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
-            $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
-            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() ,$dhcp_config->{'dns'});
-            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME() , $dhcp_config->{'domain-name'});
-            $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
-            $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
-            $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+                DHO_DHCP_MESSAGE_TYPE() => DHCPACK()
+                );
+                $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $$ip_src->address);
+                $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
+                $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
+                $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
+                $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() , $dhcp_config->{'dns'});
+                $dhcpresp->addOptionValue(DHO_DOMAIN_NAME() , $dhcp_config->{'domain-name'});
+                $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
+                $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+                $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+            # Parse the dhcp ack request
+            parse_dhcp_ack($dhcpresp,$ip_src);
 
         } else {
             # bad request, we send a NAK
@@ -306,23 +427,27 @@ sub do_request {
                 DHO_DHCP_MESSAGE(), "Bad request...",
             );
         }
+        # Create the socket
+        my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
 
-        # Socket object keeps track of whom sent last packet
-        # so we don't need to specify target address
         $logger->debug("Sending ACK/NAK tr=$dhcpresp->comment()");
         $logger->debug($dhcpresp->toString());
-        $sock_in->send($dhcpresp->serialize()) || die "Error sending ACK/NAK:$!\n";
+        # Send the packet to the network
+        $sock_in->send($dhcpresp->serialize());
         shutdown($sock_in, 2);
-    } else { #Just parse the request
-
     }
+    # No dhcp zone the we parse the dhcp request (Listener)
+    parse_dhcp_request($dhcpreq,$ip_src);
 }
 
 sub calc_ip {
     my ($dhcp_config, $net_addr,$mac,$host) = @_;
     my $ip_return;
     my $p = Net::Ping->new("icmp");
+    $logger->warn("HOST :$host") if(defined($host));
+
     if (defined($lease{$net_addr->addr}{$mac}) || (defined($host) && !$p->ping($host) ) ) {
+        #$logger->warn("RESEND $lease{$net_addr->addr}{$mac}");
         $lease{$net_addr->addr}{$net_addr->addr} = $lease{$net_addr->addr}{$net_addr->addr};
         return $lease{$net_addr->addr}{$mac};
     }
@@ -331,16 +456,317 @@ sub calc_ip {
         my $ip_last = NetAddr::IP->new($dhcp_config->{'dhcp_end'},$dhcp_config->{'netmask'});
         if (($ip + 1) eq $ip_last) {
             $ip_return = $dhcp_config->{'dhcp_start'};
+            #$logger->warn("LAST");
         } else {
             $ip = $ip + 1;
             $ip_return = $ip->addr;
+            #$logger->warn("NEXT");
         }
     } else {
         $ip_return = $dhcp_config->{'dhcp_start'};
+        #$logger->warn("START");
     }
     $lease{$net_addr->addr}{$net_addr->addr} = $ip_return;
+    #$logger->warn($ip_return);
     return $ip_return;
 }
+
+
+=item get_local_dhcp_servers
+
+Return a list of all dhcp servers IP that could be running locally.
+
+Caches results on first run then returns from cache.
+
+=cut
+sub get_local_dhcp_servers {
+
+    # return from cache
+    return @local_dhcp_servers if (@local_dhcp_servers);
+
+    # look them up, fill cache and return result
+    foreach my $network (keys %ConfigNetworks) {
+
+        push @local_dhcp_servers, $ConfigNetworks{$network}{'gateway'}
+            if ($ConfigNetworks{$network}{'dhcpd'} eq 'enabled');
+    }
+    return @local_dhcp_servers;
+}
+
+=item process_fingerprint
+
+=over
+
+=item Calls violation_trigger for every matching DHCP fingerprint type and class.
+
+=item Logs unknown fingerprints
+
+=item Returns a string that identifies OS id and name
+
+=back
+
+=cut
+sub process_fingerprint {
+    my ($dhcp) = @_;
+
+    my $dhcp_fingerprint = $dhcp->getOptionValue(DHO_DHCP_PARAMETER_REQUEST_LIST());
+    $dhcp_fingerprint =~ s/\s/,/g;
+    my $chaddr = clean_mac( substr( $dhcp->chaddr(), 0, 12 ) );
+    my $fingerprint_data;
+
+    return if (!defined($dhcp_fingerprint) || $dhcp_fingerprint eq "");
+
+    my @fingerprint_info = dhcp_fingerprint_view($dhcp_fingerprint);
+    if ( scalar(@fingerprint_info) && ( ref( $fingerprint_info[0] ) eq 'HASH' ) ) {
+
+        # precise fingerprint
+        $fingerprint_data = "OS::".$fingerprint_info[0]->{'id'}." (".$fingerprint_info[0]->{'os'}.")";
+        $logger->debug("$chaddr sending $fingerprint_data trigger");
+        violation_trigger( $chaddr, $fingerprint_info[0]->{'id'}, "OS" );
+
+        # class fingerprints
+        foreach my $class_trigger (@fingerprint_info) {
+            my $class_data = "OS::".$class_trigger->{'classid'}." (".$class_trigger->{'class'}.")";
+            $logger->debug("$chaddr sending $class_data trigger");
+            violation_trigger( $chaddr, $class_trigger->{'classid'}, "OS" );
+        }
+
+    } else {
+        my $dhcp_type = dhcp_message_type_to_string($dhcp->getOptionValue(DHO_DHCP_MESSAGE_TYPE()));
+        $logger->info("Unknown DHCP fingerprint: $dhcp_fingerprint (DHCP Message Type: $dhcp_type)");
+    }
+
+    return $fingerprint_data;
+}
+
+=item parse_dhcp_option82
+
+Option 82 is Relay Agent Information. Defined in RFC 3046.
+
+=cut
+sub parse_dhcp_option82 {
+    my ($dhcp) = @_;
+
+    # slicing the hash to retrive the stuff we are interested in
+    my ($switch, $vlan, $mod, $port)  = @{$dhcp->getOptionValue(DHO_DHCP_AGENT_OPTIONS())}{'switch', 'vlan', 'module', 'port'};
+    if ( defined($switch) && defined($vlan) && defined($mod) && defined($port) ) {
+
+        # TODO port should be translated into ifIndex
+        # FIXME option82 stuff needs to be re-validated (#1340)
+        locationlog_insert_closed($switch, $mod . '/' . $port, $vlan, clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ), '');
+    }
+}
+
+sub update_iplog {
+    my ( $srcmac, $srcip, $lease_length ) = @_;
+    $logger->debug("$srcip && $srcmac");
+
+    # return if MAC or IP is not valid
+    if ( !valid_mac($srcmac) || !valid_ip($srcip) ) {
+        $logger->error("invalid MAC or IP: $srcmac $srcip");
+        return;
+    }
+
+    my $oldmac = ip2mac($srcip);
+    my $oldip  = mac2ip($srcmac);
+
+    if ( $oldmac && $oldmac ne $srcmac ) {
+        $logger->info(
+            "oldmac ($oldmac) and newmac ($srcmac) are different for $srcip - closing iplog entry"
+        );
+        iplog_close_now($srcip);
+    }
+    if ( $oldip && $oldip ne $srcip ) {
+        my $view_mac = node_view($srcmac);
+        if ($view_mac->{'last_connection_type'} eq $connection_type_to_str{$INLINE}) {
+            my $technique = $accessControl->{_technique};
+            if ($IPSET_VERSION != 0) {
+                pf::ipset::update_node($oldip, $srcip, $srcmac);
+            }
+            #Problem with instanciate the technique Issue ID:1585
+            #$technique->update_node($oldip, $srcip, $srcmac);
+        }
+        $logger->info(
+            "oldip ($oldip) and newip ($srcip) are different for $srcmac - closing iplog entry"
+        );
+        iplog_close_now($oldip);
+    }
+    iplog_open( $srcmac, $srcip, $lease_length );
+}
+
+=item rogue_dhcp_handling
+
+Requires DHCP Server IP
+
+Optional but very useful DHCP Server MAC
+
+=cut
+sub rogue_dhcp_handling {
+    my ($dhcp_srv_ip, $dhcp_srv_mac, $offered_ip, $client_mac, $relay_ip, $if) = @_;
+
+    return if (isdisabled($Config{'network'}{'rogue_dhcp_detection'}));
+
+    # if server ip is empty, it means that the client is asking for it's old IP and this should be legit
+    if (!defined($dhcp_srv_ip)) {
+        $logger->debug(
+            "received empty DHCP Server IP in rogue detection. " .
+            "Offered IP: " . ( defined($offered_ip) ? $offered_ip : 'unknown' )
+        );
+        return;
+    }
+
+    # ignore local DHCP servers
+    return if ( grep({$_ eq $dhcp_srv_ip} get_local_dhcp_servers()) );
+
+    # ignore whitelisted DHCP servers
+    return if ( grep({$_ eq $dhcp_srv_ip} split(/\s*,\s*/, $Config{'general'}{'dhcpservers'})) );
+
+    my $rogue_offer = sprintf( "%s: %15s to %s on interface %s", mysql_date(), $offered_ip, $client_mac,$$if->name );
+    if (defined($relay_ip) && $relay_ip !~ /^0\.0\.0\.0$/) {
+        $rogue_offer .= " received via relay $relay_ip";
+    }
+    $rogue_offer .= "\n";
+    push @{ $rogue_servers{$dhcp_srv_ip} }, $rogue_offer;
+
+    # if I have a MAC use it, otherwise look it up
+    $dhcp_srv_mac = ip2mac($dhcp_srv_ip) if (!defined($dhcp_srv_mac));
+    if ($dhcp_srv_mac) {
+        violation_trigger( $dhcp_srv_mac, $ROGUE_DHCP_TRIGGER, 'INTERNAL' );
+    } else {
+        $logger->info("Unable to find MAC based on IP $dhcp_srv_ip for rogue DHCP server");
+        $dhcp_srv_mac = 'unknown';
+    }
+
+    $logger->warn("$dhcp_srv_ip ($dhcp_srv_mac) was detected offering $offered_ip to $client_mac on ".$$if->name);
+    if (scalar( @{ $rogue_servers{$dhcp_srv_ip} } ) == $Config{'network'}{'rogueinterval'} ) {
+        my %rogue_message;
+        $rogue_message{'subject'} = "ROGUE DHCP SERVER DETECTED AT $dhcp_srv_ip ($dhcp_srv_mac) ON $$if->name\n";
+        $rogue_message{'message'} = '';
+        if ($dhcp_srv_mac ne 'unknown') {
+            $rogue_message{'message'} .= pf::lookup::node::lookup_node($dhcp_srv_mac) . "\n";
+        }
+        $rogue_message{'message'} .= "Detected Offers\n---------------\n";
+        while ( @{ $rogue_servers{$dhcp_srv_ip} } ) {
+            $rogue_message{'message'} .= pop( @{ $rogue_servers{$dhcp_srv_ip} } );
+        }
+        $rogue_message{'message'} .=
+            "\n\nIf this DHCP Server is legitimate, make sure to add it to the dhcpservers list under General.\n"
+        ;
+        pfmailer(%rogue_message);
+    }
+}
+
+=item parse_dhcp_discover
+
+=cut
+sub parse_dhcp_discover {
+    my ($dhcp,$if) = @_;
+    $logger->debug("DHCPDISCOVER from ". clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ));
+}
+
+=item parse_dhcp_offer
+
+=cut
+sub parse_dhcp_offer {
+    my ($dhcp,$if) = @_;
+
+    if ($dhcp->yiaddr() =~ /^0\.0\.0\.0$/) {
+        $logger->warn("DHCPOFFER invalid IP in DHCP's yiaddr for ". clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ));
+        return;
+    }
+
+    $logger->info("DHCPOFFER from ".$$if->address." to host ". clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." (".$dhcp->yiaddr().")");
+
+    rogue_dhcp_handling($$if->address, undef, $dhcp->yiaddr(), clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ), $dhcp->giaddr(),$if);
+}
+
+=item parse_dhcp_request
+
+=cut
+sub parse_dhcp_request {
+    my ($dhcp,$if) = @_;
+    $logger->debug("DHCPREQUEST from ". clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ));
+
+    my $lease_length = $dhcp->getOptionValue(DHO_DHCP_LEASE_TIME());
+    my $client_ip = $dhcp->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS());
+    if (defined($client_ip) && $client_ip !~ /^0\.0\.0\.0$/) {
+        $logger->info(
+            "DHCPREQUEST from ". clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." (".$client_ip.")"
+            . ( defined($lease_length) ? " with lease of $lease_length seconds" : "")
+        );
+        update_iplog( clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ), $client_ip, $lease_length );
+    }
+
+    # As per RFC2131 in a DHCPREQUEST if ciaddr is set and we broadcast, we are in re-binding state
+    # in which case we are not interested in detecting rogue DHCP
+    if ($dhcp->ciaddr() =~ /^0\.0\.0\.0$/) {
+        rogue_dhcp_handling($dhcp->getOptionValue(DHO_DHCP_SERVER_IDENTIFIER()), undef, $client_ip, clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ), $dhcp->giaddr(),$if);
+    }
+
+    if ($is_inline_vlan) {
+        locationlog_synchronize($interface_ip, $NO_PORT, $interface_vlan, clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ), $NO_VOIP, $INLINE);
+        $accessControl->performInlineEnforcement(clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ));
+    }
+}
+
+
+=item parse_dhcp_ack
+
+=cut
+sub parse_dhcp_ack {
+    my ($dhcp,$if) = @_;
+
+    my $s_ip = $$if->address;
+    my $s_mac = $$if->hwaddr;
+
+    my $lease_length = $dhcp->getOptionValue(DHO_DHCP_LEASE_TIME());
+
+    if ($dhcp->yiaddr() !~ /^0\.0\.0\.0$/) {
+
+        $logger->info(
+            "DHCPACK from $s_ip ($s_mac) to host ". clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." (". $dhcp->yiaddr().")"
+            . ( defined($lease_length) ? " for $lease_length seconds" : "" )
+        );
+        update_iplog( clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ), $dhcp->yiaddr(), $lease_length );
+
+    } elsif ($dhcp->ciaddr() !~ /^0\.0\.0\.0$/) {
+
+        $logger->info(
+            "DHCPACK CIADDR from $s_ip ($s_mac) to host ".clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." (".$dhcp->ciaddr().")"
+            . ( defined($lease_length) ? " for $lease_length seconds" : "")
+        );
+        update_iplog( clean_mac( substr( $dhcp->chaddr(), 0, 12 ) ), $dhcp->ciaddr(), $lease_length );
+
+    } else {
+        $logger->warn(
+            "invalid DHCPACK from $s_ip ($s_mac) to host ".clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." [".$dhcp->yiaddr()." - ".$dhcp->ciaddr()."]"
+        );
+    }
+}
+
+=item parse_dhcp_release
+
+=cut
+sub parse_dhcp_release {
+    my ($dhcp,$if) = @_;
+    $logger->debug("DHCPRELEASE from ". clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." (".$dhcp->ciaddr().")");
+    iplog_close($dhcp->ciaddr());
+}
+
+=item parse_dhcp_inform
+
+=cut
+sub parse_dhcp_inform {
+    my ($dhcp,$if) = @_;
+    $logger->warn("DHCPINFORM from ".clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." (".$dhcp->ciaddr().")");
+}
+
+sub dhcp_message_type_to_string {
+    my ($id) = @_;
+
+    return $MESSAGE_TYPE_TO_STRING{$id};
+}
+
 
 sub daemonize {
     chdir '/' or $logger->logdie("Can't chdir to /: $!");
@@ -370,29 +796,3 @@ sub normal_sighandler {
     }
 }
 
-=head1 AUTHOR
-
-Inverse inc. <info@inverse.ca>
-
-=head1 COPYRIGHT
-
-Copyright (C) 2005-2013 Inverse inc.
-
-=head1 LICENSE
-
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 2
-of the License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
-USA.
-
-=cut
