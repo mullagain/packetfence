@@ -94,14 +94,14 @@ POSIX::sigaction(
     POSIX::SigAction->new(
         'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
     )
-) or $logger->logdie("pfdns: could not set SIGHUP handler: $!");
+) or $logger->logdie("pfdhcpd: could not set SIGHUP handler: $!");
 
 POSIX::sigaction(
     &POSIX::SIGTERM,
     POSIX::SigAction->new(
         'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
     )
-) or $logger->logdie("pfdns: could not set SIGTERM handler: $!");
+) or $logger->logdie("pfdhcpd: could not set SIGTERM handler: $!");
 
 POSIX::sigaction(
     &POSIX::SIGINT,
