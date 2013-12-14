@@ -86,6 +86,8 @@ sub managers {
     return @{$self->pfdhcplistenerManagers};
 }
 
+has '+launcher' => (default => sub { '%1$s -d -l &' } );
+
 sub isManaged {
     isenabled($Config{'network'}{'dhcpdetector'})
 }
@@ -93,6 +95,7 @@ sub isManaged {
 =head1 AUTHOR
 
 Inverse inc. <info@inverse.ca>
+
 
 =head1 COPYRIGHT
 
@@ -118,4 +121,3 @@ USA.
 =cut
 
 1;
-

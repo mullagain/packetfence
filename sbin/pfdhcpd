@@ -31,9 +31,6 @@ use List::MoreUtils qw(uniq);
 use Readonly;
 use Digest::MD5;
 
-use Data::Dumper;
-
-
 use constant INSTALL_DIR => '/usr/local/pf';
 
 use lib INSTALL_DIR . "/lib";
@@ -81,7 +78,7 @@ my @local_dhcp_servers;
 # initialization
 # --------------
 # assign process name (see #1464)
-$PROGRAM_NAME = basename($PROGRAM_NAME);
+$PROGRAM_NAME = basename($0);
 
 # log4perl init
 Log::Log4perl->init_and_watch( INSTALL_DIR . "/conf/log.conf", $LOG4PERL_RELOAD_TIMER );
@@ -96,31 +93,31 @@ POSIX::sigaction(
     POSIX::SigAction->new(
         'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
     )
-) or $logger->logdie("pfdhcpd: could not set SIGHUP handler: $!");
+) or $logger->logdie("basename($PROGRAM_NAME): could not set SIGHUP handler: $!");
 
 POSIX::sigaction(
     &POSIX::SIGTERM,
     POSIX::SigAction->new(
         'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
     )
-) or $logger->logdie("pfdhcpd: could not set SIGTERM handler: $!");
+) or $logger->logdie("basename($PROGRAM_NAME): could not set SIGTERM handler: $!");
 
 POSIX::sigaction(
     &POSIX::SIGINT,
     POSIX::SigAction->new(
         'normal_sighandler', POSIX::SigSet->new(), &POSIX::SA_NODEFER
     )
-) or $logger->logdie("pfdhcpd: could not set SIGINT handler: $!");
+) or $logger->logdie("basename($PROGRAM_NAME): could not set SIGINT handler: $!");
 
 
 my %args;
-getopts( 'dtsh:', \%args );
+getopts( 'dshl:', \%args );
 
 my $daemonize = $args{d};
 
-my $testflag = $args{t};
-
 my $stat = $args{s};
+
+my $listener = $args{l};
 
 pod2usage( -verbose => 1 ) if ( $args{h} );
 
@@ -146,7 +143,7 @@ foreach $int (@ints) {
 # Adding to select:
 my $read_set = new IO::Select();
 
-my $keep_int;
+my $keep_int = '';
 
 foreach $sock_in (@ip_addr) {
     $read_set->add($sock_in);
@@ -251,16 +248,16 @@ sub dhcpd_handler {
 
         # Add mac if not exist
         my $mac = clean_mac( substr( $dhcpreq->chaddr(), 0, 12 ) );
-        if ( !node_exist($mac) && (!defined($testflag))) {
+        if ( !node_exist($mac) ) {
             $logger->info("Unseen before node added: $mac");
             node_add_simple($mac);
         }
     
         # There is activity from that mac, call node wakeup
-        node_mac_wakeup($mac) if (!defined($testflag));
+        node_mac_wakeup($mac);
     
         # Option 82 Relay Agent Information (RFC3046)
-        if ( isenabled( $Config{'network'}{'dhcpoption82logger'} ) && defined( $dhcpreq->getOptionValue(DHO_DHCP_AGENT_OPTIONS()) ) && !defined($testflag) ) {
+        if ( isenabled( $Config{'network'}{'dhcpoption82logger'} ) && defined( $dhcpreq->getOptionValue(DHO_DHCP_AGENT_OPTIONS()) ) ) {
             parse_dhcp_option82($dhcpreq);
         }
     
@@ -275,7 +272,7 @@ sub dhcpd_handler {
         $tmp{'last_dhcp'} = mysql_date();
         $tmp{'computername'} = defined($dhcpreq->getOptionValue(DHO_HOST_NAME() )) ? $dhcpreq->getOptionValue(DHO_HOST_NAME() ) : '';
         my $vendor_id = defined($dhcpreq->getOptionValue(DHO_VENDOR_CLASS_IDENTIFIER() )) ? $dhcpreq->getOptionValue(DHO_VENDOR_CLASS_IDENTIFIER() ) : '';
-        node_modify( $mac, %tmp ) if (!defined($testflag));
+        node_modify( $mac, %tmp ) ;
         my $fingerprint_data = process_fingerprint($dhcpreq);
 
         if (defined($stat)) {
@@ -304,9 +301,9 @@ sub dhcpd_handler {
         } elsif ($messagetype eq DHCPREQUEST()) {
             do_request($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr);
         } elsif ($messagetype eq DHCPINFORM()) {
-            parse_dhcp_inform($dhcpreq,\$if)  if (!defined($testflag));         
+            parse_dhcp_inform($dhcpreq,\$if) ;         
         } elsif ($messagetype eq DHCPRELEASE()) {
-            parse_dhcp_release($dhcpreq,\$if)  if (!defined($testflag));
+            parse_dhcp_release($dhcpreq,\$if);
         } else {
             $logger->warn("Packet dropped");
             # bad messagetype, we drop it
@@ -364,10 +361,10 @@ sub do_discover {
             $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
 
         # Parse the dhcp offer
-        parse_dhcp_offer($dhcpresp,$ip_src) if (!defined($testflag));
+        parse_dhcp_offer($dhcpresp,$ip_src) ;
 
         $logger->debug($dhcpresp->toString());
-        if(!defined($testflag)) {
+        if(!defined($listener)) {
             # Parse the dhcp offer
             parse_dhcp_offer($dhcpresp,$ip_src);
             # Create the socket to answer to the client
@@ -379,7 +376,7 @@ sub do_discover {
         }
     }
     # Parse the dhcp discover in all case
-    parse_dhcp_discover($dhcpreq,$ip_src) if (!defined($testflag));
+    parse_dhcp_discover($dhcpreq,$ip_src);
 }
 
 sub do_request {
@@ -434,7 +431,7 @@ sub do_request {
                 $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
                 $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
             # Parse the dhcp ack request
-            parse_dhcp_ack($dhcpresp,$ip_src) if (!defined($testflag));
+            parse_dhcp_ack($dhcpresp,$ip_src) ;
 
         } else {
             # bad request, we send a NAK
@@ -457,7 +454,7 @@ sub do_request {
         $logger->debug("Sending ACK/NAK tr=$dhcpresp->comment()");
         $logger->debug($dhcpresp->toString());
 
-        if (!defined($testflag)) {
+        if (!defined($listener)) {
             # Create the socket
             my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
 
@@ -467,7 +464,7 @@ sub do_request {
         }
     }
     # No dhcp zone the we parse the dhcp request (Listener)
-    parse_dhcp_request($dhcpreq,$ip_src) if (!defined($testflag));
+    parse_dhcp_request($dhcpreq,$ip_src) ;
 }
 
 sub calc_ip {
@@ -807,23 +804,23 @@ sub daemonize {
         or $logger->logdie("Can't write to /dev/null: $!");
 
     defined( my $pid = fork )
-        or $logger->logdie("pfdhcpd: could not fork: $!");
+        or $logger->logdie("basename($PROGRAM_NAME): could not fork: $!");
     POSIX::_exit(0) if ($pid);
     if ( !POSIX::setsid() ) {
         $logger->error("could not start a new session: $!");
     }
     open STDERR, '>&STDOUT' or $logger->logdie("Can't dup stdout: $!");
-    my $daemon_pid = createpid("pfdhcpd");
+    my $daemon_pid = createpid(basename($PROGRAM_NAME));
 
     # updating Log4perl's pid info
     Log::Log4perl::MDC->put( 'tid', $daemon_pid );
 }
 
 sub normal_sighandler {
-    deletepid("pfdhcpd");
+    deletepid(basename($PROGRAM_NAME));
     if ( threads->self->tid() == 0 ) {
         $logger->logdie(
-            "pfdhcpd: caught SIG" . $_[0] . " - terminating" );
+            "basename($PROGRAM_NAME): caught SIG" . $_[0] . " - terminating" );
     }
 }
 

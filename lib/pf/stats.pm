@@ -5,8 +5,9 @@ use DBI;
 use Readonly;
 
 use pf::util qw(oui_to_vendor);
+use pf::config;
 
-Readonly::Scalar our $DATABASE                => './result.db';
+Readonly::Scalar our $DATABASE                => "$var_dir/result.db";
 
 =item new
 
@@ -50,10 +51,10 @@ sub stats_dns {
 
     $this->mac_exist($mac);
 
-    my $sth = $sqlite->prepare( "SELECT Domain FROM dns WHERE mac = (?) and Domain = (?) " );
+    my $sth = $sqlite->prepare( "SELECT Domain FROM dns WHERE mac = (?) and domain = (?) " );
     $sth->execute($mac,$domain);
     if (!$sth->fetchrow()) {
-        $sth = $sqlite->prepare( "INSERT INTO dns(mac,Domain) VALUES (?,?)");
+        $sth = $sqlite->prepare( "INSERT INTO dns(mac,domain) VALUES (?,?)");
         $sth->execute($mac,$domain);
     }
 }
@@ -64,10 +65,10 @@ sub stats_dhcp {
 
     $this->mac_exist($mac);
 
-    my $sth = $sqlite->prepare( "SELECT mac FROM dhcp WHERE mac = (?) and HASH =(?)" );
+    my $sth = $sqlite->prepare( "SELECT mac FROM dhcp WHERE mac = (?) and hash =(?)" );
     $sth->execute($mac,$hash);
     if (!$sth->fetchrow()) {
-        $sth = $sqlite->prepare( "INSERT INTO dhcp(mac,Finger,Vendor_ID,Computer_name,HASH,Detect) VALUES (?,?,?,?,?,?)");
+        $sth = $sqlite->prepare( "INSERT INTO dhcp(mac,finger,vendor_id,computer_name,hash,detect) VALUES (?,?,?,?,?,?)");
         $sth->execute($mac,$finger,$vendor_id,$computer_name,$hash,$detect);
     }
 }
@@ -78,10 +79,10 @@ sub stats_http {
 
     $this->mac_exist($mac);
 
-    my $sth = $sqlite->prepare( "SELECT mac FROM http WHERE mac = (?) and URL = (?) and UA = (?) and UAPROF =(?)" );
+    my $sth = $sqlite->prepare( "SELECT mac FROM http WHERE mac = (?) and url = (?) and user_agent = (?) and uaprof =(?)" );
     $sth->execute($mac,$url,$user_agent,$headers);
     if (!$sth->fetchrow()) {
-        $sth = $sqlite->prepare( "INSERT INTO http(mac,URL,UA,UAPROF) VALUES (?,?,?,?)");
+        $sth = $sqlite->prepare( "INSERT INTO http(mac,url,user_agent,uaprof) VALUES (?,?,?,?)");
         $sth->execute($mac,$url,$user_agent,$headers);
     }
 }
@@ -96,7 +97,7 @@ sub mac_exist {
     $sth->execute($mac);
 
     if (!$sth->fetchrow()) {
-        $sth = $sqlite->prepare( "INSERT INTO mac(mac,Vendor) VALUES (?,?)");
+        $sth = $sqlite->prepare( "INSERT INTO mac(mac,vendor) VALUES (?,?)");
         $sth->execute($mac,$vendor);
     }
 }  
@@ -113,13 +114,13 @@ sub create_tables {
     my $sqlite = $this->{'sqlite'};
 
     $sqlite->do("DROP TABLE IF EXISTS mac");
-    $sqlite->do("CREATE TABLE mac(mac TEXT PRIMARY KEY, Vendor TEXT)");
+    $sqlite->do("CREATE TABLE mac(mac TEXT PRIMARY KEY, vendor TEXT)");
     $sqlite->do("DROP TABLE IF EXISTS dhcp");
-    $sqlite->do("CREATE TABLE dhcp(Id INTEGER PRIMARY KEY AUTOINCREMENT,mac TEXT, Finger TEXT, Vendor_ID TEXT, Computer_name TEXT, HASH TEXT, Detect TEXT)");
+    $sqlite->do("CREATE TABLE dhcp(id INTEGER PRIMARY KEY AUTOINCREMENT,mac TEXT, finger TEXT, vendor_id TEXT, computer_name TEXT, hash TEXT, detect TEXT)");
     $sqlite->do("DROP TABLE IF EXISTS dns");
-    $sqlite->do("CREATE TABLE dns(Id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT , Domain TEXT)");
+    $sqlite->do("CREATE TABLE dns(id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT , domain TEXT)");
     $sqlite->do("DROP TABLE IF EXISTS http");
-    $sqlite->do("CREATE TABLE http(Id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, URL TEXT, UA TEXT, UAPROF TEXT)");
+    $sqlite->do("CREATE TABLE http(id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, url TEXT, user_agent TEXT, uaprof TEXT)");
     $sqlite->do("VACUUM");
 }
 
@@ -131,7 +132,7 @@ sub export_dhcp_fingerprint {
     
     $sth->execute;
 
-    open FILE, ">>", "dhcp_finger.csv" or die $!;
+    open FILE, ">>", "$var_dir/dhcp_finger.csv" or die $!;
 
     my $row;
  
