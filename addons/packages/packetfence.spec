@@ -146,10 +146,9 @@ Requires: perl(Net::OAuth2) >= 0.57
 # Required by configurator script, pf::config
 Requires: perl(Net::Interface)
 Requires: perl(Net::Netmask)
-# pfmon, pfdhcplistener
-Requires: perl(Net::Pcap) >= 0.16
-# pfdhcplistener
-Requires: perl(NetPacket) >= 1.2.0
+# pfdhcpd
+Requires: perl(Net::DHCP::Packet)
+Requires: perl(Tie::Hash::Expire)
 # pfdns
 Requires: perl(Net::DNS) = 0.65
 Requires: perl(Net::DNS::Nameserver) = 749
