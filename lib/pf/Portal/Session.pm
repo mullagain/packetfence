@@ -82,7 +82,15 @@ sub _initialize {
 
     $self->{'_guest_node_mac'} = undef;
 
-    $self->{'_profile'} = pf::Portal::ProfileFactory->instantiate($self->getClientMac);
+    if ($self->getClientIp eq $management_network->{'Tip'} ) {
+        if (defined ($cgi->param('PROFILE'))) {
+            $self->{'_profile'} = pf::Portal::ProfileFactory-> _from_profile($cgi->param('PROFILE'));
+         } else {
+            $self->{'_profile'} = pf::Portal::ProfileFactory->instantiate($self->getClientMac);
+    } else {
+        $self->{'_profile'} = pf::Portal::ProfileFactory->instantiate($self->getClientMac);
+    }
+
 
     $self->{'_destination_url'} = $self->_getDestinationUrl();
 
