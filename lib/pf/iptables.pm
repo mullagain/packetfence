@@ -289,6 +289,7 @@ sub generate_inline_rules {
 
     if ($google_enabled||$facebook_enabled||$github_enabled||$passthrough_enabled) {
         $$filter_rules_ref .= "-A $FW_FILTER_FORWARD_INT_INLINE --match mark --mark 0x$IPTABLES_MARK_UNREG -m set --match-set pfsession_passthrough dst,dst --jump ACCEPT\n";
+        $$filter_rules_ref .= "-A $FW_FILTER_FORWARD_INT_INLINE --match mark --mark 0x$IPTABLES_MARK_ISOLATION -m set --match-set pfsession_passthrough dst,dst --jump ACCEPT\n";
     }
 
 
@@ -463,6 +464,8 @@ sub generate_nat_redirect_rules {
     if ($google_enabled||$facebook_enabled||$github_enabled||$passthrough_enabled) {
          $rules .= "-A $FW_PREROUTING_INT_INLINE -m set --match-set pfsession_passthrough dst,dst ".
                "--match mark --mark 0x$IPTABLES_MARK_UNREG --jump ACCEPT\n";
+         $rules .= "-A $FW_PREROUTING_INT_INLINE -m set --match-set pfsession_passthrough dst,dst ".
+               "--match mark --mark 0x$IPTABLES_MARK_ISOLATION --jump ACCEPT\n";
     }
 
     # Now, do your magic
