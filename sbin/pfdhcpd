@@ -360,9 +360,6 @@ sub do_discover {
             $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
             $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
 
-        # Parse the dhcp offer
-        parse_dhcp_offer($dhcpresp,$ip_src) ;
-
         $logger->debug($dhcpresp->toString());
         if(!defined($listener)) {
             # Parse the dhcp offer
