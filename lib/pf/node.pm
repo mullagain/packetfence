@@ -322,7 +322,7 @@ sub node_db_prepare {
     $node_statements->{'node_last_reg_sql'} = get_db_handle()->prepare(qq [ select mac from node order by regdate DESC LIMIT 1,1 ]);
 
     $node_statements->{'node_update_bandwidth_sql'} = get_db_handle()->prepare(qq[
-        UPDATE node SET bandwidth_balance = COALESCE(bandwidth_balance, 0) + ?
+        UPDATE node SET bandwidth_balance = GREATEST(0, COALESCE(bandwidth_balance, 0) + ?)
         WHERE mac = ?
     ]);
 
@@ -979,7 +979,7 @@ sub node_update_bandwidth {
     # Validate arguments
     $mac = clean_mac($mac);
     $logger->logdie("Invalid MAC address") unless (valid_mac($mac));
-    $logger->logdie("Invalid number of bytes") unless ($bytes =~ m/^\d+$/);
+    $logger->logdie("Invalid number of bytes") unless ($bytes =~ m/^-?\d+$/);
 
     # Upate node table
     my $sth = db_query_execute(NODE, $node_statements, 'node_update_bandwidth_sql', $bytes, $mac);
