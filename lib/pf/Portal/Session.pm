@@ -85,8 +85,9 @@ sub _initialize {
     if ($self->getClientIp eq $management_network->{'Tip'} ) {
         if (defined ($cgi->param('PROFILE'))) {
             $self->{'_profile'} = pf::Portal::ProfileFactory-> _from_profile($cgi->param('PROFILE'));
-         } else {
+        } else {
             $self->{'_profile'} = pf::Portal::ProfileFactory->instantiate($self->getClientMac);
+        }
     } else {
         $self->{'_profile'} = pf::Portal::ProfileFactory->instantiate($self->getClientMac);
     }
