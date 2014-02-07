@@ -124,9 +124,14 @@ sub handler {
         $proto = isenabled($Config{'captive_portal'}{'secure_redirect'}) ? $HTTPS : $HTTP;
     }
 
+    my $captiv_url = APR::URI->parse($r->pool,"$proto://".${captivePortalDomain}."/captive-portal");
+    $captiv_url->query("destination_url=$destination_url&".$r->args);
+    my $wispr_url = APR::URI->parse($r->pool,"$proto://".${captivePortalDomain}."/wispr");
+    $wispr_url->query("destination_url=$destination_url&".$r->args);
+
     my $stash = {
-        'login_url' => "${proto}://${captivePortalDomain}/captive-portal?destination_url=$destination_url",
-        'login_url_wispr' => "${proto}://${captivePortalDomain}/wispr"
+        'login_url' => $captiv_url->unparse(),
+        'login_url_wispr' => $wispr_url->unparse(),
     };
 
     # prepare custom REDIRECT response
