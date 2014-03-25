@@ -50,7 +50,7 @@ use JSON;
 use Readonly;
 
 Readonly::Scalar my $WEBAPI_SCHEME     => 'http';
-Readonly::Scalar my $WEBAPI_PORT       => $Config{'soap'}{'port'};
+Readonly::Scalar my $WEBAPI_PORT       => $Config{'ports'}{'soap'};
 Readonly::Scalar my $WEBAPI_RESOURCE => 'json';
 Readonly::Scalar my $WEBAPI_URI        => 
     $WEBAPI_SCHEME . '://' . 'localhost' . ':' . $WEBAPI_PORT . '/' . $WEBAPI_RESOURCE;
@@ -127,13 +127,13 @@ sub _vlan_reevaluation {
                 . $connection_type_explained{$conn_type} );
 
         if ( ( $conn_type & $WIRED ) == $WIRED ) {
-            $logger->debug("Calling json WebAPI with ReAssign request on switch $switch for mac $mac");
-            _call_WebAPI( 'ReAssign', $switch, $mac, $conn_type, $ifIndex );
+            $logger->debug("Calling json WebAPI with ReAssign request on switch $switch_id for mac $mac");
+            _call_WebAPI( 'ReAssign', $switch_id, $mac, $conn_type, $ifIndex );
 
         }
         elsif ( ( $conn_type & $WIRELESS ) == $WIRELESS ) {
-            $logger->debug("Calling json WebAPI with desAssociate request on switch $switch for mac $mac");
-            _call_WebAPI( 'desAssociate', $switch, $mac, $conn_type );
+            $logger->debug("Calling json WebAPI with desAssociate request on switch $switch_id for mac $mac");
+            _call_WebAPI( 'desAssociate', $switch_id, $mac, $conn_type );
 
         }
         else {
