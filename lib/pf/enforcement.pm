@@ -49,11 +49,11 @@ use LWP::UserAgent;
 use JSON;
 use Readonly;
 
-Readonly::Scalar my $HTTP_SCHEME  => 'http';
-Readonly::Scalar my $HTTP_HOST    => 'localhost';
-Readonly::Scalar my $HTTP_PORT    => '9090';
-Readonly::Scalar my $HTTP_REQUEST => 'json';
-Readonly::Scalar my $HTTP_URI => $HTTP_SCHEME . '://' . $HTTP_HOST . ':' . $HTTP_PORT . '/' . $HTTP_REQUEST;
+Readonly::Scalar my $WEBAPI_SCHEME     => 'http';
+Readonly::Scalar my $WEBAPI_PORT       => $Config{'soap'}{'port'};
+Readonly::Scalar my $WEBAPI_RESOURCE => 'json';
+Readonly::Scalar my $WEBAPI_URI        => 
+    $WEBAPI_SCHEME . '://' . 'localhost' . ':' . $WEBAPI_PORT . '/' . $WEBAPI_RESOURCE;
 
 =head1 SUBROUTINES
 
@@ -219,7 +219,7 @@ sub _call_WebAPI {
         'ifIndex'         => $ifIndex
     );
     my $json = encode_json \%info;
-    my $req = HTTP::Request->new( 'POST', $HTTP_URI );
+    my $req = HTTP::Request->new( 'POST', $WEBAPI_URI );
     $req->header( 'Content-Type' => 'application/json' );
     $req->header( 'Request'      => $request );
     $req->content($json);
