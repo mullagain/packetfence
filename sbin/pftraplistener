@@ -1,0 +1,62 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use feature "say";
+use Log::Log4perl;
+#use WWW::Curl::Easy;
+
+#use XML::Dumper;
+use SOAP::Lite;
+
+# Configuration parameter
+use constant WS_PORT => '9090';
+use constant WS_HOST => '172.20.125.1';
+use constant API_URI => 'https://www.packetfence.org/PFAPI';
+use constant WS_USER => 'pf';
+use constant WS_PASS => 'pf';
+
+print STDERR "Loaded the perl snmptrapd handler\n";
+
+NetSNMP::TrapReceiver::register( "all", \&trap_receiver )
+    || warn "failed to register our perl trap handler\n";
+
+sub trap_receiver {
+    my %PDU      = %{ $_[0] };
+    my @VARBINDS = @{ $_[1] };
+
+    my %VARBINDS
+        = map { $_->[0] => ( sprintf "type=%-2d value=%s", $_->[2], $_->[1] ); } @VARBINDS;
+
+    my %trap = (
+        PDU      => \%PDU,
+        VARBINDS => \%VARBINDS,
+        PFTYPE   => undef,
+    );
+    $trap{"PFTYPE"} = "snmptrap";
+
+    my $soap = new SOAP::Lite(
+        uri   => API_URI,
+        proxy => 'http://' . WS_USER . ':' . WS_PASS . '@' . WS_HOST . ':' . WS_PORT . '/webapi'
+    ) or die "SOAP call failed: $!\n";
+
+    my $som = $soap->add_snmp_trap(%trap);
+    say "SOAP error" if $som->fault;
+    say $som->result();
+
+    # prepare the CURL request
+    #my $function = 'add_snmp_trap';
+    #my $curl     = WWW::Curl::Easy->new;
+    #my $response_body;
+    #$curl->setopt( CURLOPT_HEADER,               0 );
+    #$curl->setopt( CURLOPT_DNS_USE_GLOBAL_CACHE, 0 );
+    #$curl->setopt( CURLOPT_NOSIGNAL,             1 );
+    #$curl->setopt( CURLOPT_URL, 'http://' . WS_USER . ':' . WS_PASS . '@' . WS_HOST . ':' . WS_PORT );
+    #$curl->setopt( CURLOPT_HTTPHEADER,
+    #    [ 'Content-Type: application/soap+xml; charset=UTF-8', "Request: $function" ] );
+    #$curl->setopt( CURLOPT_POSTFIELDS, $request );
+    #$curl->setopt( CURLOPT_WRITEDATA,  \$response_body );
+
+    # Starts the actual request
+    #my $curl_return_code = $curl->perform;
+
+}
