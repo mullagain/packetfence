@@ -21,68 +21,32 @@ use warnings;
 use base ('pf::Switch');
 use Log::Log4perl;
 use Net::SNMP;
+use HTTP::Headers;
+use HTTP::Request;
+use LWP::UserAgent;
+use JSON;
 
 sub description { 'PacketFence' }
-
-sub connectWrite {
-    my $this   = shift;
-    my $logger = Log::Log4perl::get_logger( ref($this) );
-    if ( defined( $this->{_sessionWrite} ) ) {
-        return 1;
-    }
-    $logger->debug("opening SNMP v1 connection to 127.0.0.1");
-    ( $this->{_sessionWrite}, $this->{_error} ) = Net::SNMP->session(
-        -hostname  => '127.0.0.1',
-        -version   => 1,
-        -port      => '162',
-        -community => $this->{_SNMPCommunityTrap}
-    );
-    if ( !defined( $this->{_sessionWrite} ) ) {
-        $logger->error( "error creating SNMP v1 connection to 127.0.0.1: "
-                . $this->{_error} );
-        return 0;
-    }
-    return 1;
-}
 
 sub sendLocalReAssignVlanTrap {
     my ($this, $switch, $ifIndex, $connection_type, $mac) = @_;
     my $switch_ip = $switch->{_ip};
     my $switch_id = $switch->{_id};
     my $logger = Log::Log4perl::get_logger( ref($this) );
-    if ( !$this->connectWrite() ) {
-        return 0;
-    }
-    my $result;
-    if (defined($mac)) {
-        $result = $this->{_sessionWrite}->trap(
-            -genericTrap => Net::SNMP::ENTERPRISE_SPECIFIC,
-            -agentaddr   => $switch_ip,
-            -varbindlist => [
-                '1.3.6.1.6.3.1.1.4.1.0', Net::SNMP::OBJECT_IDENTIFIER, '1.3.6.1.4.1.29464.1.1',
-                "1.3.6.1.2.1.2.2.1.1.$ifIndex", Net::SNMP::INTEGER,    $ifIndex,
-                "1.3.6.1.2.1.2.2.1.1.$ifIndex", Net::SNMP::INTEGER,    $connection_type,
-                "1.3.6.1.4.1.29464.1.3", Net::SNMP::OCTET_STRING,      $mac,
-                "1.3.6.1.4.1.29464.1.5", Net::SNMP::OCTET_STRING,      $switch_id,
-            ]
-        );
-    } else {
-        $result = $this->{_sessionWrite}->trap(
-            -genericTrap => Net::SNMP::ENTERPRISE_SPECIFIC,
-            -agentaddr   => $switch_ip,
-            -varbindlist => [
-                '1.3.6.1.6.3.1.1.4.1.0', Net::SNMP::OBJECT_IDENTIFIER, '1.3.6.1.4.1.29464.1.1',
-                "1.3.6.1.2.1.2.2.1.1.$ifIndex", Net::SNMP::INTEGER,    $ifIndex,
-                "1.3.6.1.2.1.2.2.1.1.$ifIndex", Net::SNMP::INTEGER,    $connection_type,
-                "1.3.6.1.4.1.29464.1.5", Net::SNMP::OCTET_STRING,      $switch_id,
-            ]
-        );
-    }
-    if ( !$result ) {
-        $logger->error(
-            "error sending SNMP trap: " . $this->{_sessionWrite}->error() );
-    }
+
+    my %info = ('switch' => $switch_id, 'mac' => $mac, 'connection_type' => $connection_type, 'ifIndex' => $ifIndex);
+    my $json = encode_json \%info;
+    my $uri = 'http://127.0.0.1:9090/json';
+    my $req = HTTP::Request->new( 'POST', $uri );
+    $req->header( 'Content-Type' => 'application/json' );
+    $req->header( 'Request' => 'ReAssign');
+    $req->content( $json );
+
+    my $lwp = LWP::UserAgent->new;
+    $lwp->request( $req );
+
     return 1;
+
 }
 
 sub sendLocalDesAssociateTrap {
@@ -90,24 +54,20 @@ sub sendLocalDesAssociateTrap {
     my $switch_ip = $switch->{_ip};
     my $switch_id = $switch->{_id};
     my $logger = Log::Log4perl::get_logger( ref($this) );
-    if ( !$this->connectWrite() ) {
-        return 0;
-    }
-    my $result = $this->{_sessionWrite}->trap(
-        -genericTrap => Net::SNMP::ENTERPRISE_SPECIFIC,
-        -agentaddr   => $switch_ip,
-        -varbindlist => [
-            '1.3.6.1.6.3.1.1.4.1.0', Net::SNMP::OBJECT_IDENTIFIER, '1.3.6.1.4.1.29464.1.2',
-            "1.3.6.1.4.1.29464.1.3", Net::SNMP::OCTET_STRING,      $mac,
-            "1.3.6.1.4.1.29464.1.4", Net::SNMP::INTEGER,           $connection_type,
-            "1.3.6.1.4.1.29464.1.5", Net::SNMP::OCTET_STRING,      $switch_id,
-        ]
-    );
-    if ( !$result ) {
-        $logger->error(
-            "error sending SNMP trap: " . $this->{_sessionWrite}->error() );
-    }
+
+    my %info = ('switch' => $switch_id, 'mac' => $mac, 'connection_type' => $connection_type);
+    my $json = encode_json \%info;
+    my $uri = 'http://127.0.0.1:9090/json';
+    my $req = HTTP::Request->new( 'POST', $uri );
+    $req->header( 'Content-Type' => 'application/json' );
+    $req->header( 'Request' => 'desAssociate');
+    $req->content( $json );
+
+    my $lwp = LWP::UserAgent->new;
+    $lwp->request( $req );
+
     return 1;
+
 }
 
 =head2 sendLocalFirewallRequestTrap
@@ -121,22 +81,20 @@ sub sendLocalFirewallRequestTrap {
     my $switch_ip = $switch->{_ip};
     my $switch_id = $switch->{_id};
     my $logger = Log::Log4perl::get_logger( ref($this) );
-    if ( !$this->connectWrite() ) {
-        return 0;
-    }
-    my $result = $this->{_sessionWrite}->trap(
-        -genericTrap => Net::SNMP::ENTERPRISE_SPECIFIC,
-        -agentaddr   => $switch_ip,
-        -varbindlist => [
-            '1.3.6.1.6.3.1.1.4.1.0', Net::SNMP::OBJECT_IDENTIFIER, '1.3.6.1.4.1.29464.1.3',
-            "1.3.6.1.4.1.29464.1.3", Net::SNMP::OCTET_STRING,      $mac,
-            "1.3.6.1.4.1.29464.1.5", Net::SNMP::OCTET_STRING,      $switch_id,
-        ]
-    );
-    if ( !$result ) {
-        $logger->error("error sending SNMP trap: " . $this->{_sessionWrite}->error());
-    }
+
+    my %info = ('switch' => $switch_id, 'mac' => $mac);
+    my $json = encode_json \%info;
+    my $uri = 'http://127.0.0.1:9090/json';
+    my $req = HTTP::Request->new( 'POST', $uri );
+    $req->header( 'Content-Type' => 'application/json' );
+    $req->header( 'Request' => 'firewall');
+    $req->content( $json );
+
+    my $lwp = LWP::UserAgent->new;
+    $lwp->request( $req );
+
     return 1;
+
 }
 
 
