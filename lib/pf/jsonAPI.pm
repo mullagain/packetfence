@@ -59,83 +59,27 @@ sub dispatch_request {
     my $logger = Log::Log4perl::get_logger('pf::jsonAPI');
 
     my $key = {
-        ReAssign => \&ReAssignVlan,
-        desAssociate  => \&desAssociate,
-        firewall => \&firewall,
+        ReAssign     => \&ReAssignVlan,
+        desAssociate => \&desAssociate,
+        firewall     => \&firewall,
+        snmptrap     => \&snmptrap,
     };
     return $key->{$request};
 }
 
 sub ReAssignVlan {
-    my $r = (shift);
+    my $r      = (shift);
     my $logger = Log::Log4perl->get_logger('pf::jsonAPI');
 
-    my $info = $r->pnotes->{info};
-    my $switch = pf::SwitchFactory->getInstance()->instantiate($info->{'switch'});
+    my $info   = $r->pnotes->{info};
+    my $switch = pf::SwitchFactory->getInstance()->instantiate( $info->{'switch'} );
 
-    if (defined($info->{'connection_type'}) && ($info->{'connection_type'} == $WIRED_802_1X || $info->{'connection_type'} == $WIRED_MAC_AUTH) ) {
-        my ($switchdeauthMethod, $deauthTechniques) = $switch->wiredeauthTechniques($switch->{_deauthMethod},$info->{'connection_type'});
-        $deauthTechniques->($info->{'switch'},$info->{'ifIndex'},$info->{'mac'});
-#    } else {
-#
-#        my @locationlog = locationlog_view_open_switchport_no_VoIP($info->{'switch'},$info->{'ifIndex'});
-#        if ((@locationlog) && ( scalar(@locationlog) > 0 ) && ( $locationlog[0]->{'mac'} ne '' )) {
-#            my $mac = $locationlog[0]->{'mac'};
-#
-#            if ( $switch->isPortSecurityEnabled($switch_port) ) {
-#                $logger->info( "security traps are configured on " . $switch->{_id}
-#                    . " ifIndex $switch_port. Re-assigning VLAN for $mac"
-#                );
-
-#                my $hasPhone = $switch->hasPhoneAtIfIndex($switch_port);
-#                node_determine_and_set_into_VLAN( $mac, $switch, $switch_port, $connection_type );
-
-#                # TODO extract that behavior in a method call in pf::vlan so it can be overridden easily
-#                if ( !$hasPhone ) {
-#                    $logger->info(
-#                        "no VoIP phone is currently connected at " . $switch->{_id} . " ifIndex $switch_port. " .
-#                        "Flipping port admin status"
-#                    );
-#                    $switch->bouncePort( $switch_port );
-#
-#                } else {
-#                    my @violations = violation_view_open_desc($mac);
-#                    if ( scalar(@violations) > 0 ) {
-#                        my %message;
-#                        $message{'subject'} = "VLAN isolation of $mac behind VoIP phone";
-#                        $message{'message'} = "The following computer has been isolated behind a VoIP phone\n";
-#                        $message{'message'} .= "MAC: $mac\n";
-#                        my $node_info = node_view($mac);
-#                        $message{'message'} .= "Owner: " . $node_info->{'pid'} . "\n";
-#                        $message{'message'} .= "Computer Name: " . $node_info->{'computername'} . "\n";
-#                        $message{'message'} .= "Notes: " . $node_info->{'notes'} . "\n";
-#                        $message{'message'} .= "Switch: " . $switch->{_id} . "\n";
-#                        $message{'message'} .= "Port (ifIndex): " . $switch_port . "\n\n";
-#                        $message{'message'} .= "The violation details are\n";
-
-#                        foreach my $violation (@violations) {
-#                            $message{'message'} .= "Description: " . $violation->{'description'} . "\n";
-#                            $message{'message'} .= "Start: " . $violation->{'start_date'} . "\n";
-#                        }
-#                        $logger->info("sending email to admin regarding isolation of $mac behind VoIP phone");
-#                        pfmailer(%message);
-#                    }
-#                    else {
-#                        $logger->warn("VLAN changed and $mac is behind VoIP phone. Not bouncing the port!");
-#                    }
-#                }
-#            } else {
-#                $logger->info(
-#                    "no security traps are configured on " . $switch->{_id} . " ifIndex $switch_port. " .
-#                    "Flipping port admin status"
-#                );
-#                $switch->bouncePort( $switch_port );
-#            }
-#        } else {
-#            $logger->warn(
-#                "received reAssignVlan trap on $switch_id ifIndex $switch_port but can't determine non VoIP MAC"
-#            );
-#        }
+    if ( defined( $info->{'connection_type'} )
+        && ( $info->{'connection_type'} == $WIRED_802_1X || $info->{'connection_type'} == $WIRED_MAC_AUTH ) )
+    {
+        my ( $switchdeauthMethod, $deauthTechniques )
+            = $switch->wiredeauthTechniques( $switch->{_deauthMethod}, $info->{'connection_type'} );
+        $deauthTechniques->( $info->{'switch'}, $info->{'ifIndex'}, $info->{'mac'} );
     }
 }
 
@@ -161,6 +105,16 @@ sub firewall {
     my $inline = new pf::inline::custom();
     $inline->performInlineEnforcement($info->{'mac'});
 }
+
+sub snmptrap {
+    my $r = (shift);
+    my $logger = Log::Log4perl->get_logger('pf::jsonAPI');
+
+    my $info = $r->pnotes->{info};
+    use Data::Dumper; $logger->warn(Dumper $info);
+
+}
+
 
 =head1 AUTHOR
 

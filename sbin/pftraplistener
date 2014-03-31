@@ -1,19 +1,21 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
+use pf::config;
 use feature "say";
 use Log::Log4perl;
-#use WWW::Curl::Easy;
-
-#use XML::Dumper;
-use SOAP::Lite;
+use Readonly;
+use JSON;
+use HTTP::Headers;
+use HTTP::Request;
+use LWP::UserAgent;
 
 # Configuration parameter
-use constant WS_PORT => '9090';
-use constant WS_HOST => '172.20.125.1';
-use constant API_URI => 'https://www.packetfence.org/PFAPI';
-use constant WS_USER => 'pf';
-use constant WS_PASS => 'pf';
+Readonly::Scalar my $WEBAPI_SCHEME   => 'http';
+Readonly::Scalar my $WEBAPI_PORT     => $Config{'ports'}{'soap'};
+Readonly::Scalar my $WEBAPI_RESOURCE => 'json';
+Readonly::Scalar my $WEBAPI_URI      => 
+    $WEBAPI_SCHEME . '://' . 'localhost' . ':' . $WEBAPI_PORT . '/' . $WEBAPI_RESOURCE;
 
 print STDERR "Loaded the perl snmptrapd handler\n";
 
@@ -33,30 +35,19 @@ sub trap_receiver {
         PFTYPE   => undef,
     );
     $trap{"PFTYPE"} = "snmptrap";
+    my $json = encode_json \%trap;
 
-    my $soap = new SOAP::Lite(
-        uri   => API_URI,
-        proxy => 'http://' . WS_USER . ':' . WS_PASS . '@' . WS_HOST . ':' . WS_PORT . '/webapi'
-    ) or die "SOAP call failed: $!\n";
+    #print $json . "\n\n";
+    my $req = HTTP::Request->new( 'POST', $WEBAPI_URI );
+    $req->header( 'Content-Type' => 'application/json' );
+    $req->header( 'Request'      => 'snmptrap' );
+    $req->content($json);
 
-    my $som = $soap->add_snmp_trap(%trap);
-    say "SOAP error" if $som->fault;
-    say $som->result();
+    my $lwp = LWP::UserAgent->new;
+    $logger->info("Calling WebAPI with $request request for mac $mac on switch $switch");
+    $lwp->request($req);
 
-    # prepare the CURL request
-    #my $function = 'add_snmp_trap';
-    #my $curl     = WWW::Curl::Easy->new;
-    #my $response_body;
-    #$curl->setopt( CURLOPT_HEADER,               0 );
-    #$curl->setopt( CURLOPT_DNS_USE_GLOBAL_CACHE, 0 );
-    #$curl->setopt( CURLOPT_NOSIGNAL,             1 );
-    #$curl->setopt( CURLOPT_URL, 'http://' . WS_USER . ':' . WS_PASS . '@' . WS_HOST . ':' . WS_PORT );
-    #$curl->setopt( CURLOPT_HTTPHEADER,
-    #    [ 'Content-Type: application/soap+xml; charset=UTF-8', "Request: $function" ] );
-    #$curl->setopt( CURLOPT_POSTFIELDS, $request );
-    #$curl->setopt( CURLOPT_WRITEDATA,  \$response_body );
-
-    # Starts the actual request
-    #my $curl_return_code = $curl->perform;
+    return 1;
 
 }
+
