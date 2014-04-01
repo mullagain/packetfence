@@ -2702,6 +2702,10 @@ msgstr ""
 msgid "The webservices user name"
 msgstr ""
 
+# conf/documentation.conf (webservices.url)
+msgid "The webservices url"
+msgstr ""
+
 # conf/documentation.conf (guests_admin_registration.access_duration_choices)
 msgid ""
   "These are all the choices offered in the access duration action of an"
@@ -4296,6 +4300,10 @@ msgstr "Password"
 # conf/documentation.conf
 msgid "webservices.user"
 msgstr "Username"
+
+# conf/documentation.conf
+msgid "webservices.url"
+msgstr "Url"
 
 # html/pfappserver/lib/pfappserver/Form/Field/Duration.pm
 msgid "weeks"
