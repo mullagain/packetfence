@@ -1,6 +1,8 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
+
+use lib '/usr/local/pf/lib';
 use pf::config;
 use feature "say";
 use Log::Log4perl;
@@ -26,6 +28,9 @@ sub trap_receiver {
     my %PDU      = %{ $_[0] };
     my @VARBINDS = @{ $_[1] };
 
+    my $logger = Log::Log4perl->get_logger('pftraplistener');
+    
+    # map the variable bindings to a hash where key is OID and value is a string containing type and value
     my %VARBINDS
         = map { $_->[0] => ( sprintf "type=%-2d value=%s", $_->[2], $_->[1] ); } @VARBINDS;
 
@@ -35,17 +40,22 @@ sub trap_receiver {
         PFTYPE   => undef,
     );
     $trap{"PFTYPE"} = "snmptrap";
+    
+    # build the HTTP request and the JSON payload
     my $json = encode_json \%trap;
-
-    #print $json . "\n\n";
     my $req = HTTP::Request->new( 'POST', $WEBAPI_URI );
     $req->header( 'Content-Type' => 'application/json' );
     $req->header( 'Request'      => 'snmptrap' );
     $req->content($json);
 
+    # send the request
     my $lwp = LWP::UserAgent->new;
-    $logger->info("Calling WebAPI with $request request for mac $mac on switch $switch");
-    $lwp->request($req);
+    $logger->info( "Calling WebAPI with snmptrap request received from " . $trap{'PDU'}->{'receivedfrom'} );
+    my $response = $lwp->request($req);
+    unless ( $response->is_success ) {
+        $logger->error( "WebAPI error in reply to snmptrap request: " . $response->status_line );
+        return undef;
+    }
 
     return 1;
 
