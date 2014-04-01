@@ -745,6 +745,18 @@ category=default
 voip=no
 
 [webservices]
-user = 
+#
+# webservices.user
+#
+# username to use to connect to the webAPI
+user =
+#
+# webservices.pass
+#
+# password of the username
 pass =
-
+#
+# webservices.url
+#
+# url where to use for the webAPI
+url=http://127.0.0.1:9090

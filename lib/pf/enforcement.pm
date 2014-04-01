@@ -43,17 +43,9 @@ use pf::node;
 use pf::SwitchFactory;
 use pf::util;
 use pf::vlan::custom $VLAN_API_LEVEL;
-use HTTP::Headers;
-use HTTP::Request;
-use LWP::UserAgent;
-use JSON;
-use Readonly;
+use pf::jsonAPI::jsonclient;
 
-Readonly::Scalar my $WEBAPI_SCHEME     => 'http';
-Readonly::Scalar my $WEBAPI_PORT       => $Config{'ports'}{'soap'};
-Readonly::Scalar my $WEBAPI_RESOURCE => 'json';
-Readonly::Scalar my $WEBAPI_URI        => 
-    $WEBAPI_SCHEME . '://' . 'localhost' . ':' . $WEBAPI_PORT . '/' . $WEBAPI_RESOURCE;
+use Readonly;
 
 =head1 SUBROUTINES
 
@@ -92,9 +84,14 @@ sub reevaluate_access {
         my $conn_type = str_to_connection_type( $locationlog_entry->{'connection_type'} );
         if ( $conn_type == $INLINE ) {
 
+            my $json_client = pf::jsonAPI::jsonclient->new();
             my $inline = new pf::inline::custom();
+            my %data = (
+                'switch'           => '127.0.0.1',
+                'mac'              => $mac,
+            );
             if ( $inline->isInlineEnforcementRequired($mac) ) {
-                _call_WebAPI( 'firewall', '127.0.0.1', $mac );
+                $json_client->call_WebAPI( 'firewall', %data );
             }
             else {
                 $logger->debug("MAC: $mac is already properly enforced in firewall, no change required");
@@ -126,14 +123,21 @@ sub _vlan_reevaluation {
                 . "connection type: "
                 . $connection_type_explained{$conn_type} );
 
+        my $json_client = pf::jsonAPI::jsonclient->new();
+        my %data = (
+            'switch'           => $switch_id,
+            'mac'              => $mac,
+            'connection_type ' => $conn_type,
+            'ifIndex'          => $ifIndex
+        );
         if ( ( $conn_type & $WIRED ) == $WIRED ) {
             $logger->debug("Calling json WebAPI with ReAssign request on switch $switch_id for mac $mac");
-            _call_WebAPI( 'ReAssign', $switch_id, $mac, $conn_type, $ifIndex );
+            $json_client->call_WebAPI( 'ReAssign', %data );
 
         }
         elsif ( ( $conn_type & $WIRELESS ) == $WIRELESS ) {
             $logger->debug("Calling json WebAPI with desAssociate request on switch $switch_id for mac $mac");
-            _call_WebAPI( 'desAssociate', $switch_id, $mac, $conn_type );
+            $json_client->call_WebAPI( 'desAssociate', %data );
 
         }
         else {
@@ -199,36 +203,6 @@ sub _should_we_reassign_vlan {
     }
     $logger->debug("No VLAN reassignment required for $mac.");
     return $FALSE;
-}
-
-=item
-sub _call_WebAPI
-
-Makes an http call to the json webapi to deassociate, reassignvlan or change firewall status.
-
-=cut
-
-sub _call_WebAPI {
-    my ( $request, $switch, $mac, $connection_type, $ifIndex ) = @_;
-    my $logger = Log::Log4perl::get_logger( ref(__PACKAGE__) );
-
-    my %info = (
-        'switch'          => $switch,
-        'mac'             => $mac,
-        'connection_type' => $connection_type,
-        'ifIndex'         => $ifIndex
-    );
-    my $json = encode_json \%info;
-    my $req = HTTP::Request->new( 'POST', $WEBAPI_URI );
-    $req->header( 'Content-Type' => 'application/json' );
-    $req->header( 'Request'      => $request );
-    $req->content($json);
-
-    my $lwp = LWP::UserAgent->new;
-    $logger->info("Calling WebAPI with $request request for mac $mac on switch $switch");
-    $lwp->request($req);
-
-    return 1;
 }
 
 =back
