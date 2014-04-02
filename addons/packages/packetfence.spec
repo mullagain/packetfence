@@ -102,7 +102,7 @@ Requires: perl >= 5.8.8
 # replaces the need for perl-suidperl which was deprecated in perl 5.12 (Fedora 14)
 Requires: %{real_name}-pfcmd-suid
 Requires: perl(Bit::Vector)
-Requires: perl(CGI::Session), perl(CGI::Session::Driver::memcached), perl(JSON), perl(PHP::Session)
+Requires: perl(CGI::Session), perl(CGI::Session::Driver::memcached), perl(JSON)
 Requires: perl(Apache2::Request)
 Requires: perl(Apache::Session)
 Requires: perl(Apache::Session::Memcached)
@@ -220,7 +220,7 @@ Requires: perl(File::Slurp)
 Requires: perl(Plack), perl(Plack::Middleware::ReverseProxy)
 Requires: perl(MooseX::Types::LoadableClass)
 Requires: perl(Moose) <= 2.1005
-Requires: perl(CHI) >= 0.58
+Requires: perl(CHI) >= 0.56
 Requires: perl(Data::Serializer)
 Requires: perl(HTML::FormHandler)
 Requires: perl(Cache::Memcached)
@@ -921,6 +921,9 @@ fi
 %attr(6755, root, root) /usr/local/pf/bin/pfcmd
 
 %changelog
+* Tue Apr 1 2014 Francis Lachapelle <flachapelle@inverse.ca>
+- Removed dependency on Perl module PHP::Session
+
 * Wed Dec 11 2013 Francis Lachapelle <flachapelle@inverse.ca> - 4.1.0-1
 - New release 4.1.0
 

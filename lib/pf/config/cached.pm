@@ -262,7 +262,7 @@ When using a value that was dervived from a configuration use a sub routine to c
 use strict;
 use warnings;
 use pf::file_paths;
-use Time::HiRes qw(stat time);
+use Time::HiRes qw(stat time gettimeofday);
 use pf::log;
 use pf::CHI;
 use pf::IniFiles;
@@ -275,6 +275,7 @@ use Sub::Name;
 use List::Util qw(first);
 use List::MoreUtils qw(uniq);
 use Fcntl qw(:flock :DEFAULT :seek);
+use POSIX::2008;
 
 
 our $CACHE;
@@ -284,13 +285,18 @@ our %ON_FILE_RELOAD;
 our %ON_FILE_RELOAD_ONCE;
 our %ON_CACHE_RELOAD;
 our %ON_POST_RELOAD;
+
 our @ON_DESTROY_REFS = (
     \%ON_RELOAD,
     \%ON_FILE_RELOAD,
     \%ON_CACHE_RELOAD,
+    \%ON_FILE_RELOAD_ONCE,
+    \%ON_POST_RELOAD,
 );
 
 our %CONFIG_DATA;
+
+our $CACHE_CONTROL_TIMESTAMP = GetControlFileTimestamp();
 
 use overload "%{}" => \&config, fallback => 1;
 
@@ -358,11 +364,12 @@ sub new {
         }
     );
     untaint($config) unless $reload_onfile;
+    $ON_RELOAD{$file} ||= [];
+    $ON_FILE_RELOAD{$file} ||= [];
+    $ON_FILE_RELOAD_ONCE{$file} ||= [];
+    $ON_CACHE_RELOAD{$file} ||= [];
+    $ON_POST_RELOAD{$file} ||= [];
     $self = \$config;
-    $ON_RELOAD{$file} = [];
-    $ON_FILE_RELOAD{$file} = [];
-    $ON_CACHE_RELOAD{$file} = [];
-    $ON_POST_RELOAD{$file} = [];
     bless $self,$class;
     push @LOADED_CONFIGS, $self;
     $self->addReloadCallbacks(@$onReload) if @$onReload;
@@ -418,7 +425,11 @@ sub RewriteConfig {
     if($result) {
         $config = $self->computeFromPath(
             $file,
-            sub { return $config; }, 1
+            sub {
+                $self->updateCacheControl();
+                return $config;
+            },
+            1
         );
         $self->doCallbacks(1,0);
     }
@@ -489,7 +500,7 @@ Call all the file reload callbacks that should be called only once
 
 sub _callFileReloadOnceCallbacks {
     my ($self) = @_;
-    my $callbacks =  $ON_FILE_RELOAD_ONCE{$self->GetFileName} || [];
+    my $callbacks = $ON_FILE_RELOAD_ONCE{$self->GetFileName} ||= [];
     $self->_doLockOnce( sub { $self->_callCallbacks(\%ON_FILE_RELOAD_ONCE) } ) if @$callbacks;
 }
 
@@ -519,13 +530,13 @@ sub doCallbacks {
     my ($self,$file_reloaded,$cache_reloaded,$skipPrePostReload) = @_;
     if($file_reloaded || $cache_reloaded) {
         get_logger()->trace("doing callbacks for " . $self->GetFileName . " file_reloaded = " . ($file_reloaded ? 1 : 0) .  "  cache_reloaded = " .  ($cache_reloaded ? 1 : 0));
-        $self->_callReloadCallbacks unless $skipPrePostReload;
+        $self->_callReloadCallbacks;
         if($file_reloaded) {
             $self->_callFileReloadCallbacks;
             $self->_callFileReloadOnceCallbacks;
         }
         $self->_callCacheReloadCallbacks if $cache_reloaded;
-        $self->_callPostReloadCallbacks unless $skipPrePostReload;
+        $self->_callPostReloadCallbacks;
     }
 }
 
@@ -533,6 +544,8 @@ sub _doLockOnce {
     my ($self,$callback) = @_;
     my $lockFile = $self->getOnReloadOnceLock();
     if ($lockFile) {
+        my $logger = get_logger();
+        $logger->debug("Doing the callback");
         $callback->();
         flock($lockFile,LOCK_UN);
         close($lockFile);
@@ -545,12 +558,13 @@ sub getOnReloadOnceLock {
     my $fh = IO::File->new;
     my $old_umask = umask(002);
     my $lockFile = $self->GetFileName() . ".lockone" ;
+    $logger->debug("opening $lockFile");
     if (sysopen($fh,$lockFile,O_CREAT|O_RDWR) ) {
         if( flock($fh,LOCK_EX | LOCK_NB) ) {
             my $previousTimestamp;
             sysread $fh,$previousTimestamp,20;
             $previousTimestamp ||= 0;
-            my $currentTimeStamp = $self->{_timestamp} || -1;
+            my $currentTimeStamp = $self->GetLastModTimestamp();
             if($currentTimeStamp == $previousTimestamp) {
                 flock($fh,LOCK_UN);
                 close($fh);
@@ -754,16 +768,19 @@ sub computeFromPath {
     $computeSub = undef;
     return $result;
 }
-#controlFileExpired($_[0]->value->{_control_file_timestamp}) &&
+
 sub SetControlFileTimestamp {
     my ($self) = @_;
-    $self->{_control_file_timestamp} = pf::IniFiles::_getFileTimestamp($cache_control_file);
+    $self->{_control_file_timestamp} = GetControlFileTimestamp();
 }
+
+sub GetControlFileTimestamp { int((stat($cache_control_file))[9] || 0) * 1000000000 }
 
 sub controlFileExpired {
     my ($timestamp) = @_;
-    return $timestamp == -1 || $timestamp != pf::IniFiles::_getFileTimestamp($cache_control_file);
+    $timestamp != GetControlFileTimestamp();
 }
+
 
 =head2 cache
 
@@ -792,6 +809,8 @@ ReloadConfigs reload all configs and call any register callbacks
 =cut
 
 sub ReloadConfigs {
+    return unless controlFileExpired($CACHE_CONTROL_TIMESTAMP);
+    $CACHE_CONTROL_TIMESTAMP = GetControlFileTimestamp();
     my $logger = get_logger();
     $logger->trace("Reloading all configs");
     foreach my $config (@LOADED_CONFIGS) {
@@ -1028,14 +1047,18 @@ sub updateCacheControl {
     my ($dontCreate) = @_;
     if ( !-e $cache_control_file && !$dontCreate) {
         my $fh;
-        open($fh,">$cache_control_file") or die "cannot create $cache_control_file\nplease pfcmd fixpermissions";
+        open($fh,">$cache_control_file") or die "cannot create $cache_control_file\nplease run pfcmd fixpermissions";
         __changeFilesToOwner('pf',$cache_control_file);
         close($fh);
     }
     if(-e $cache_control_file) {
-        my ($atime,$mtime);
-        $atime = $mtime = time;
-        utime $atime, $mtime, $cache_control_file;
+        sysopen(my $fh,$cache_control_file,O_RDWR | O_CREAT);
+        my ($seconds) = time();
+        my ($usec, $s) = POSIX::modf($seconds);
+        my $nanosec = int($usec * 1000000000) + int(rand(1000)) + 1000;
+        $s = int($s);
+        POSIX::2008::futimens(fileno $fh, $s, $nanosec, $s, $nanosec);
+        close($fh);
     }
     return 0;
 }
