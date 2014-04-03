@@ -64,8 +64,10 @@ sub call_WebAPI {
     my $lwp = LWP::UserAgent->new;
 
     $logger->info("Calling WebAPI with $request request");
-    $lwp->request($req);
-
+    my $response = $lwp->request($req);
+    unless ( $response->is_success ) {
+        $logger->error( "WebAPI error in reply to snmptrap request: " . $response->status_line );
+    }
     return 1;
 }
 
