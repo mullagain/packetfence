@@ -66,7 +66,7 @@ sub call_WebAPI {
     $logger->info("Calling WebAPI with $request request");
     my $response = $lwp->request($req);
     unless ( $response->is_success ) {
-        $logger->error( "WebAPI error in reply to snmptrap request: " . $response->status_line );
+        $logger->error( "WebAPI error in reply to $request request: " . $response->status_line );
     }
     return 1;
 }
