@@ -38,7 +38,7 @@ use pf::Portal::Session;
 use pf::web::provisioning::custom;
 use pf::web::externalportal;
 use pf::stats;
-use pf::iplog qw(mac2ip);
+use pf::iplog qw(ip2mac);
 
 =head1 SUBROUTINES
 
