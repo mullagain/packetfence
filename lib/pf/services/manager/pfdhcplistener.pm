@@ -1,4 +1,5 @@
 package pf::services::manager::pfdhcplistener;
+
 =head1 NAME
 
 pf::services::manager::pfdhcplistener add documentation
@@ -14,10 +15,12 @@ pf::services::manager::pfdhcplistener
 use strict;
 use warnings;
 use Moo;
+use pf::config;
+use pf::util;
 
 extends 'pf::services::manager';
 
-has '+name' => ( default => sub { 'pdhcplistener' } );
+has '+name' => ( default => sub { 'pfdhcplistener' } );
 
 has '+launcher' => (default => sub { '%1$s -d -l &' } );
 
