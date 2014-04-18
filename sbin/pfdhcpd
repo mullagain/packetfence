@@ -110,6 +110,7 @@ POSIX::sigaction(
     )
 ) or $logger->logdie("basename($PROGRAM_NAME): could not set SIGINT handler: $!");
 
+our $RUNNING = 1;
 
 my %args;
 getopts( 'dshl:', \%args );
@@ -175,7 +176,7 @@ foreach my $network ( keys %ConfigNetworks ) {
 
 
 # entering loop
-while (1) {
+while ($RUNNING) {
     my @select_set = $read_set->can_read;
     foreach my $server (@select_set) {
         my $handler = $listen_handler{$server};
@@ -798,12 +799,9 @@ sub dhcp_message_type_to_string {
     return $MESSAGE_TYPE_TO_STRING{$id};
 }
 
-
 sub normal_sighandler {
-    deletepid(basename($PROGRAM_NAME));
-    if ( threads->self->tid() == 0 ) {
-        $logger->logdie(
-            "basename($PROGRAM_NAME): caught SIG" . $_[0] . " - terminating" );
-    }
+    $RUNNING = 0;
+    $logger->debug( "$PROGRAM_NAME: caught SIG" . $_[0] . " - terminating" );
 }
+
 
