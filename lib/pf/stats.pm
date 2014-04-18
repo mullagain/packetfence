@@ -74,16 +74,16 @@ sub stats_dhcp {
 }
 
 sub stats_http {
-    my($this,$mac,$url,$user_agent,$headers) = @_;
+    my($this,$mac,$hash,$user_agent,$headers,$suites) = @_;
     my $sqlite = $this->{'sqlite'};
 
     $this->mac_exist($mac);
 
-    my $sth = $sqlite->prepare( "SELECT mac FROM http WHERE mac = (?) and url = (?) and user_agent = (?) and uaprof =(?)" );
-    $sth->execute($mac,$url,$user_agent,$headers);
+    my $sth = $sqlite->prepare( "SELECT mac FROM http WHERE mac = (?) and hash = (?)" );
+    $sth->execute($mac,$hash);
     if (!$sth->fetchrow()) {
-        $sth = $sqlite->prepare( "INSERT INTO http(mac,url,user_agent,uaprof) VALUES (?,?,?,?)");
-        $sth->execute($mac,$url,$user_agent,$headers);
+        $sth = $sqlite->prepare( "INSERT INTO http(mac,hash,user_agent,uaprof,suites) VALUES (?,?,?,?,?)");
+        $sth->execute($mac,$hash,$user_agent,$headers,$suites);
     }
 }
 
@@ -120,7 +120,7 @@ sub create_tables {
     $sqlite->do("DROP TABLE IF EXISTS dns");
     $sqlite->do("CREATE TABLE dns(id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT , domain TEXT)");
     $sqlite->do("DROP TABLE IF EXISTS http");
-    $sqlite->do("CREATE TABLE http(id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, url TEXT, user_agent TEXT, uaprof TEXT)");
+    $sqlite->do("CREATE TABLE http(id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, hash TEXT, user_agent TEXT, uaprof TEXT, suites TEXT)");
     $sqlite->do("VACUUM");
 }
 
