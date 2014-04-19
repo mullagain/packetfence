@@ -44,6 +44,28 @@ use pf::iplog qw(ip2mac);
 
 =over
 
+=item uaprof
+
+try to retrieve user agent profile
+
+=cut
+
+sub uaprof {
+    my $r = shift;
+    my $uaprof = $r->headers_in->{'x-wap-profile'} || $r->headers_in->{'Profile'};
+    if (!defined($uaprof)) {
+        if (defined($r->headers_in->{'Opt'})) {
+            my $opt = $r->headers_in->{'Opt'};
+            if ($opt = /ns=(\d+)/) {
+                 $uaprof = $r->headers_in->{"$1-Profile"};
+            }
+        } else {
+            return '';
+        }
+    }
+    return $uaprof;
+}
+
 =item translate
 
 Implementation of PerlTransHandler. Rewrite all URLs except those explicitly
@@ -69,7 +91,7 @@ sub handler {
         my $md5 = Digest::MD5->new;
         my $suites = $r->subprocess_env("SSLHAF_SUITES") || '';
         my $user_agent = $r->headers_in->{'User-Agent'} || '';
-        my $ua_prof = '';
+        my $ua_prof = uaprof($r);
         $md5->add($user_agent, $suites);
         $stats->stats_http($mac,$md5->hexdigest,$user_agent,$ua_prof,$suites);
     }
