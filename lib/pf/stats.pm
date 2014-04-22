@@ -91,13 +91,13 @@ sub stats_http {
 sub mac_exist {
     my($this,$mac) = @_;
 
-    my $vendor = oui_to_vendor($mac);
     my $sqlite = $this->{'sqlite'};    
     my $sth = $sqlite->prepare( "SELECT mac FROM mac WHERE mac = (?)" );
     $sth->execute($mac);
 
     if (!$sth->fetchrow()) {
         $sth = $sqlite->prepare( "INSERT INTO mac(mac,vendor) VALUES (?,?)");
+        my $vendor = oui_to_vendor($mac);
         $sth->execute($mac,$vendor);
     }
 }  
