@@ -70,7 +70,6 @@ sub oauth2_client {
     my $logger = $c->log;
     my $portalSession = $c->portalSession;
     my $type;
-    use Data::Dumper;
     my $token_scheme = "auth-header:OAuth";
     if (lc($provider) eq 'facebook') {
         $type = pf::Authentication::Source::FacebookSource->meta->get_attribute('type')->default;
@@ -85,11 +84,11 @@ sub oauth2_client {
     if ($type) {
         my $source = $portalSession->profile->getSourceByType($type);
         if ($source) {
-            my $oauth = Net::OAuth2::Profile::WebServer->new(
+            return Net::OAuth2::Profile::WebServer->new(
                 client_id => $source->{'client_id'},
                 client_secret => $source->{'client_secret'},
                 site => $source->{'site'},
-                authorize_path => $source->{'authorize_path'}."?state=ahjsadhffdnisausadfsad",
+                authorize_path => $source->{'authorize_path'},
                 access_token_path => $source->{'access_token_path'},
                 access_token_method => $source->{'access_token_method'},
                 #access_token_param => $source->{'access_token_param'},
@@ -97,8 +96,6 @@ sub oauth2_client {
                 redirect_uri => $source->{'redirect_url'},
                 token_scheme => $token_scheme, 
           );
-          $logger->info(Dumper($oauth));
-          return $oauth;
         }
         else {
             $logger->error(sprintf("No source of type '%s' defined for profile '%s'", $type, $portalSession->profile->getName));
@@ -123,7 +120,7 @@ sub oauth2Result : Path : Args(1) {
     my $request       = $c->request;
     my %info;
     my $pid;
-    use Data::Dumper;
+
     # Pull username
     $info{'pid'} = "admin";
 
@@ -131,6 +128,8 @@ sub oauth2Result : Path : Args(1) {
     $info{'user_agent'} = $request->user_agent;
 
     my $code = $request->query_params->{'code'};
+
+    $logger->debug("API CODE: $code");
 
     #Get the token
     my $token;
@@ -198,7 +197,7 @@ sub oauth2Result : Path : Args(1) {
             $logger->info(
                 "OAuth2: failed to validate the token, redireting to login page"
             );
-            $c->stash->{txt_auth_error} = "OAuth2 Error: Failed to validate the token, please retry";
+            $c->stash->{txt_auth_error} = i18n("OAuth2 Error: Failed to validate the token, please retry");
             $c->detach(Authentication => 'showLogin');
         }
 
