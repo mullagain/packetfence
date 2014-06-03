@@ -31,9 +31,12 @@ use List::MoreUtils qw(uniq);
 use Readonly;
 use Digest::MD5;
 
-use constant INSTALL_DIR => '/usr/local/pf';
-
-use lib INSTALL_DIR . "/lib";
+BEGIN {
+    # log4perl init
+    use constant INSTALL_DIR => '/usr/local/pf';
+    use lib INSTALL_DIR . "/lib";
+    use pf::log(service => 'pfdhcplistener');
+}
 
 use pf::services::util;
 use pf::config;
@@ -81,12 +84,7 @@ my @local_dhcp_servers;
 # assign process name (see #1464)
 $PROGRAM_NAME = basename($0);
 
-# log4perl init
-Log::Log4perl->init_and_watch( INSTALL_DIR . "/conf/log.conf", $LOG4PERL_RELOAD_TIMER );
 my $logger = Log::Log4perl->get_logger( basename($PROGRAM_NAME) );
-Log::Log4perl::MDC->put( 'proc', basename($PROGRAM_NAME) );
-# storing process id instead of thread id in tid (more useful)
-Log::Log4perl::MDC->put( 'tid', $PID );
 
 # init signal handlers
 POSIX::sigaction(
@@ -166,12 +164,10 @@ foreach $sock_in (@ip_addr) {
 }
 
 
-# Create lease hash (expire hash)
+# Keep the last ip send by the server
 
 foreach my $network ( keys %ConfigNetworks ) {
-    my %expire;
-    tie %expire, 'Tie::Hash::Expire', {'expire_seconds' => $ConfigNetworks{$network}{'dhcp_max_lease_time'}};
-    $lease{$network} = \%expire;
+    $lease{$network} = $ConfigNetworks{$network}{'dhcp_start'};
 }
 
 
@@ -339,7 +335,6 @@ sub do_discover {
         # Calculate the ip address
         my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr);
         #File the lease hash
-        $lease{$net->addr}{$dhcpreq->chaddr} = $ip;
         # Need the broadcast address
         my $broadcast = $$net_addr->broadcast();
 
@@ -358,7 +353,7 @@ sub do_discover {
             DHO_DHCP_MESSAGE_TYPE() => DHCPOFFER()
             );
             $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $$ip_src->address);
-            $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
+            $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
             $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
             $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
             $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() , $dhcp_config->{'dns'});
@@ -399,9 +394,6 @@ sub do_request {
         # Calculate the ip address
         my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr,$dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS()));
 
-        # File the lease hash
-        $lease{$net->addr}{$dhcpreq->chaddr} = $ip; 
-
         # Need the broadcast address
         my $broadcast = $$net_addr->broadcast();
 
@@ -426,7 +418,7 @@ sub do_request {
                 DHO_DHCP_MESSAGE_TYPE() => DHCPACK()
                 );
                 $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $$ip_src->address);
-                $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_max_lease_time'});
+                $dhcpresp->addOptionValue(DHO_DHCP_LEASE_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
                 $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
                 $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
                 $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() , $dhcp_config->{'dns'});
@@ -434,9 +426,6 @@ sub do_request {
                 $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
                 $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
                 $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
-            # Parse the dhcp ack request
-            parse_dhcp_ack($dhcpresp,$ip_src) ;
-
         } else {
             # bad request, we send a NAK
             $dhcpresp = new Net::DHCP::Packet(
@@ -460,46 +449,52 @@ sub do_request {
 
         if (!defined($listener)) {
             # Create the socket
+            # Send broadcast packet
             my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
+            # Send the packet to the network
+            $sock_in->send($dhcpresp->serialize());
+            shutdown($sock_in, 2);
+
+            # Send Unicast
+            $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', PeerAddr => "$ip:68");
 
             # Send the packet to the network
             $sock_in->send($dhcpresp->serialize());
             shutdown($sock_in, 2);
         }
+    } else {
+        # No dhcp zone the we parse the dhcp request (Listener)
+        parse_dhcp_request($dhcpreq,$ip_src);
     }
-    # No dhcp zone the we parse the dhcp request (Listener)
-    parse_dhcp_request($dhcpreq,$ip_src) ;
 }
 
 sub calc_ip {
     my ($dhcp_config, $net_addr,$mac,$host) = @_;
     my $ip_return;
-    my $p = Net::Ping->new("icmp");
+    $mac = clean_mac( substr( $mac, 0, 12 ) );
 
-    #$logger->warn("HOST :$host") if(defined($host));
-
-    if (defined($lease{$net_addr->addr}{$mac}) || (defined($host) && !$p->ping($host) ) ) {
-        #$logger->warn("RESEND $lease{$net_addr->addr}{$mac}");
-        $lease{$net_addr->addr}{$net_addr->addr} = $lease{$net_addr->addr}{$net_addr->addr};
-        return $lease{$net_addr->addr}{$mac};
-    }
-    if (defined($lease{$net_addr->addr}{$net_addr->addr})) {
-        my $ip = NetAddr::IP->new($lease{$net_addr->addr}{$net_addr->addr},$dhcp_config->{'netmask'});
+    my $node_iplog_info = iplog_view_open_mac($mac);
+    if (defined($node_iplog_info->{'ip'}) && (defined($host) && $node_iplog_info->{'ip'} eq $host ) ) {
+        update_iplog( $mac, $node_iplog_info->{'ip'}, $dhcp_config->{'dhcp_max_lease_time'} );
+        return $node_iplog_info->{'ip'};
+    } elsif (defined($node_iplog_info->{'ip'})) {
+        update_iplog( $mac, $node_iplog_info->{'ip'}, $dhcp_config->{'dhcp_max_lease_time'} );
+        return $node_iplog_info->{'ip'};
+    } elsif (defined($lease{$net_addr->addr})) {
+        my $ip = NetAddr::IP->new($lease{$net_addr->addr},$dhcp_config->{'netmask'});
         my $ip_last = NetAddr::IP->new($dhcp_config->{'dhcp_end'},$dhcp_config->{'netmask'});
         if (($ip + 1) eq $ip_last) {
             $ip_return = $dhcp_config->{'dhcp_start'};
-            #$logger->warn("LAST");
         } else {
             $ip = $ip + 1;
             $ip_return = $ip->addr;
-            #$logger->warn("NEXT");
         }
     } else {
         $ip_return = $dhcp_config->{'dhcp_start'};
-        #$logger->warn("START");
     }
-    $lease{$net_addr->addr}{$net_addr->addr} = $ip_return;
-    #$logger->warn($ip_return);
+    # Keep the last ip
+    $lease{$net_addr->addr} = $ip_return;
+    update_iplog( $mac, $ip_return, $dhcp_config->{'dhcp_max_lease_time'} );
     return $ip_return;
 }
 

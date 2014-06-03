@@ -148,7 +148,6 @@ Requires: perl(Net::Interface)
 Requires: perl(Net::Netmask)
 # pfdhcpd
 Requires: perl(Net::DHCP::Packet)
-Requires: perl(Tie::Hash::Expire)
 # pfdns
 Requires: perl(Net::DNS) = 0.65
 Requires: perl(Net::DNS::Nameserver) = 749
