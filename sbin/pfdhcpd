@@ -207,6 +207,7 @@ sub dhcpd_handler {
         next if ($!);        # continue loop if an error occured
         $transaction++;                    # transaction counter
         my $peeraddr; 
+        my $layer3 = 0;
         {
             use bytes;
 
@@ -215,6 +216,7 @@ sub dhcpd_handler {
             my $ipaddr = inet_ntoa($addr);
 
             $logger->debug("Got a packet tr=$transaction src=$ipaddr:$port length=".length($buf));
+            #The answer is different if it is a layer 3 network
             #Suppose Layer 2 search for the direct network
             if ($ipaddr eq '0.0.0.0') {
                 $peeraddr = '255.255.255.255';
@@ -237,6 +239,7 @@ sub dhcpd_handler {
                         my $net = $net_addr->network;
                         my $netAddress = $net->addr;
                         %dhcp_config = %{$ConfigNetworks{$netAddress}} if(exists $ConfigNetworks{$netAddress} && defined $ConfigNetworks{$netAddress});
+                        $layer3 = 1;
                         last;
                     }
                 }
@@ -300,11 +303,11 @@ sub dhcpd_handler {
         my $messagetype = $dhcpreq->getOptionValue(DHO_DHCP_MESSAGE_TYPE());
 
         if ($messagetype eq DHCPDISCOVER()) {
-            do_discover($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr);
+            do_discover($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr,$layer3);
         } elsif ($messagetype eq DHCPREQUEST()) {
-            do_request($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr);
+            do_request($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr,$layer3);
         } elsif ($messagetype eq DHCPINFORM()) {
-            parse_dhcp_inform($dhcpreq,\$if) ;         
+            do_inform($dhcpreq,$peeraddr,\$if,\%dhcp_config,\$net_addr,$layer3);
         } elsif ($messagetype eq DHCPRELEASE()) {
             parse_dhcp_release($dhcpreq,\$if);
         } else {
@@ -321,7 +324,7 @@ sub dhcpd_handler {
 }
 
 sub do_discover {
-    my ($dhcpreq, $peeraddr, $ip_src,$dhcp_config,$net_addr) = @_;
+    my ($dhcpreq, $peeraddr, $ip_src,$dhcp_config,$net_addr,$layer3) = @_;
     # $dhcpreq is the dhcp request object
     # $peeraddr is the ip source of the packet
     # $ip_src is the network interface where the packet is coming
@@ -334,7 +337,7 @@ sub do_discover {
 
         # Calculate the ip address
         my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr);
-        #File the lease hash
+
         # Need the broadcast address
         my $broadcast = $$net_addr->broadcast();
 
@@ -347,7 +350,7 @@ sub do_discover {
             Flags => $dhcpreq->flags(),
             Ciaddr => $dhcpreq->ciaddr(),
             Yiaddr => $ip,
-            Siaddr => $dhcpreq->siaddr(),
+            Siaddr => $$ip_src->address,
             Giaddr => $dhcpreq->giaddr(),
             Chaddr => $dhcpreq->chaddr(),
             DHO_DHCP_MESSAGE_TYPE() => DHCPOFFER()
@@ -366,9 +369,11 @@ sub do_discover {
         if(!defined($listener)) {
             # Parse the dhcp offer
             parse_dhcp_offer($dhcpresp,$ip_src);
-            # Create the socket to answer to the client
-            my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
 
+            my $peer = "$peeraddr:68";
+            $peer = "$peeraddr:67" if ($layer3);
+            # Create the socket to answer to the client
+            my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peer");
             # Send the packet to the network
             $sock_in->send($dhcpresp->serialize());
             shutdown($sock_in, 2);
@@ -379,7 +384,7 @@ sub do_discover {
 }
 
 sub do_request {
-    my ($dhcpreq,$peeraddr,$ip_src,$dhcp_config,$net_addr) = @_;
+    my ($dhcpreq,$peeraddr,$ip_src,$dhcp_config,$net_addr,$layer3) = @_;
     # $dhcpreq is the dhcp request object
     # $peeraddr is the ip source of the packet
     # $ip_src is the network interface where the packet is coming
@@ -393,6 +398,9 @@ sub do_request {
 
         # Calculate the ip address
         my $ip = calc_ip($dhcp_config,$net,$dhcpreq->chaddr,$dhcpreq->getOptionValue(DHO_DHCP_REQUESTED_ADDRESS()));
+
+        # File the lease hash
+        # $lease{$net->addr}{$dhcpreq->chaddr} = $ip; 
 
         # Need the broadcast address
         my $broadcast = $$net_addr->broadcast();
@@ -412,7 +420,7 @@ sub do_request {
                 Flags => $dhcpreq->flags(),
                 Ciaddr => $dhcpreq->ciaddr(),
                 Yiaddr => $ip,
-                Siaddr => $dhcpreq->siaddr(),
+                Siaddr => $$ip_src->address,
                 Giaddr => $dhcpreq->giaddr(),
                 Chaddr => $dhcpreq->chaddr(),
                 DHO_DHCP_MESSAGE_TYPE() => DHCPACK()
@@ -426,6 +434,7 @@ sub do_request {
                 $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
                 $dhcpresp->addOptionValue(DHO_DHCP_RENEWAL_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
                 $dhcpresp->addOptionValue(DHO_DHCP_REBINDING_TIME() , $dhcp_config->{'dhcp_default_lease_time'});
+
         } else {
             # bad request, we send a NAK
             $dhcpresp = new Net::DHCP::Packet(
@@ -448,22 +457,26 @@ sub do_request {
         $logger->debug($dhcpresp->toString());
 
         if (!defined($listener)) {
-            # Create the socket
-            # Send broadcast packet
-            my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
-            # Send the packet to the network
-            $sock_in->send($dhcpresp->serialize());
-            shutdown($sock_in, 2);
-
-            # Send Unicast
-            $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', PeerAddr => "$ip:68");
-
-            # Send the packet to the network
-            $sock_in->send($dhcpresp->serialize());
-            shutdown($sock_in, 2);
+            my $sock_in;
+            if ($layer3) {
+                $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', ,PeerAddr => "$peeraddr:67");
+               # Send the packet to the network
+               $sock_in->send($dhcpresp->serialize());
+               shutdown($sock_in, 2);
+            } else {
+                $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', Broadcast => 1,PeerAddr => "$peeraddr:68");
+                # Send the packet to the network
+                $sock_in->send($dhcpresp->serialize());
+                shutdown($sock_in, 2);
+                # Send a unicast packet
+                $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', PeerAddr => "$ip:68");
+                # Send the packet to the network
+                $sock_in->send($dhcpresp->serialize());
+                shutdown($sock_in, 2);
+           }
         }
     } else {
-        # No dhcp zone the we parse the dhcp request (Listener)
+        # No dhcp zone then we parse the dhcp request (Listener)
         parse_dhcp_request($dhcpreq,$ip_src);
     }
 }
@@ -474,12 +487,13 @@ sub calc_ip {
     $mac = clean_mac( substr( $mac, 0, 12 ) );
 
     my $node_iplog_info = iplog_view_open_mac($mac);
-    if (defined($node_iplog_info->{'ip'}) && (defined($host) && $node_iplog_info->{'ip'} eq $host ) ) {
+
+    my $ip = new NetAddr::IP::Lite clean_ip($node_iplog_info->{'ip'}) if defined($node_iplog_info->{'ip'});
+    # Device still exist in iplog, resend the same ip address
+    if (defined($node_iplog_info->{'ip'}) && $net_addr->contains($ip) ) {
         update_iplog( $mac, $node_iplog_info->{'ip'}, $dhcp_config->{'dhcp_max_lease_time'} );
         return $node_iplog_info->{'ip'};
-    } elsif (defined($node_iplog_info->{'ip'})) {
-        update_iplog( $mac, $node_iplog_info->{'ip'}, $dhcp_config->{'dhcp_max_lease_time'} );
-        return $node_iplog_info->{'ip'};
+    # Send a new address + 1 or the starting ip address of the dhcp zone
     } elsif (defined($lease{$net_addr->addr})) {
         my $ip = NetAddr::IP->new($lease{$net_addr->addr},$dhcp_config->{'netmask'});
         my $ip_last = NetAddr::IP->new($dhcp_config->{'dhcp_end'},$dhcp_config->{'netmask'});
@@ -492,7 +506,7 @@ sub calc_ip {
     } else {
         $ip_return = $dhcp_config->{'dhcp_start'};
     }
-    # Keep the last ip
+    # Keep the last assign address
     $lease{$net_addr->addr} = $ip_return;
     update_iplog( $mac, $ip_return, $dhcp_config->{'dhcp_max_lease_time'} );
     return $ip_return;
@@ -780,12 +794,61 @@ sub parse_dhcp_release {
     iplog_close($dhcp->ciaddr());
 }
 
-=item parse_dhcp_inform
+=item do_inform
 
 =cut
-sub parse_dhcp_inform {
-    my ($dhcp,$if) = @_;
-    $logger->warn("DHCPINFORM from ".clean_mac( substr( $dhcp->chaddr(), 0, 12 ) )." (".$dhcp->ciaddr().")");
+sub do_inform {
+ my ($dhcpreq,$peeraddr,$ip_src,$dhcp_config,$net_addr) = @_;
+    # $dhcpreq is the dhcp request object
+    # $peeraddr is the ip source of the packet
+    # $ip_src is the network interface where the packet is coming
+    # $dhcp_config is the dhcp config for this network from networks.conf
+    # $net_addr is a NetAddr::IP object of the dhcp zone
+
+    # If we find a dhcp configuration then we have to answer
+    if ($dhcp_config->{'netmask'}) {
+        my $dhcpresp;
+        my $net = $$net_addr->network;
+
+        # Calculate the ip address
+
+        # Need the broadcast address
+        my $broadcast = $$net_addr->broadcast();
+        my $ip = $dhcpreq->ciaddr;
+
+        $dhcpresp = new Net::DHCP::Packet(
+            Comment => $dhcpreq->comment(),
+            Op => BOOTREPLY(),
+            Hops => $dhcpreq->hops(),
+            Xid => $dhcpreq->xid(),
+            Flags => $dhcpreq->flags(),
+            Ciaddr => $dhcpreq->ciaddr(),
+            Yiaddr => $dhcpreq->ciaddr(),
+            Siaddr => $$ip_src->address,
+            Giaddr => $dhcpreq->giaddr(),
+            Chaddr => $dhcpreq->chaddr(),
+            DHO_DHCP_MESSAGE_TYPE() => DHCPACK()
+            );
+            $dhcpresp->addOptionValue(DHO_DHCP_SERVER_IDENTIFIER() , $$ip_src->address);
+            $dhcpresp->addOptionValue(DHO_SUBNET_MASK() , $dhcp_config->{'netmask'});
+            $dhcpresp->addOptionValue(DHO_ROUTERS() , $dhcp_config->{'gateway'});
+            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME_SERVERS() , $dhcp_config->{'dns'});
+            $dhcpresp->addOptionValue(DHO_DOMAIN_NAME() , $dhcp_config->{'domain-name'});
+            $dhcpresp->addOptionValue(DHO_BROADCAST_ADDRESS() , $broadcast->addr);
+
+        $logger->debug("Sending ACK/NAK tr=$dhcpresp->comment()");
+        $logger->debug($dhcpresp->toString());
+
+        if (!defined($listener)) {
+            # Send Unicast
+            my $sock_in = IO::Socket::INET->new(Type => SOCK_DGRAM, Reuse => 1, LocalPort => 67, LocalAddr => $$ip_src->address, Proto => 'udp', PeerAddr => "$ip:68");
+
+            # Send the packet to the network
+            $sock_in->send($dhcpresp->serialize());
+            shutdown($sock_in, 2);
+        }
+    }
+    $logger->warn("DHCPINFORM from ".clean_mac( substr( $dhcpreq->chaddr(), 0, 12 ) )." (".$dhcpreq->ciaddr().")");
 }
 
 sub dhcp_message_type_to_string {
